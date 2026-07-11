@@ -1,0 +1,18 @@
+[Unit]
+Description=Binance Futures Pro Scalper v14 - Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Testdriv12/binance-futures-pro-scalper-v14
+EnvironmentFile=/home/ubuntu/Testdriv12/binance-futures-pro-scalper-v14/.env
+ExecStart=/home/ubuntu/Testdriv12/binance-futures-pro-scalper-v14/.venv/bin/python -m bot
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/ubuntu/Testdriv12/binance-futures-pro-scalper-v14/logs/bot.out
+StandardError=append:/home/ubuntu/Testdriv12/binance-futures-pro-scalper-v14/logs/bot.out
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,58 @@
+{
+  "updated_at": "2026-07-11T04:09:33Z",
+  "role": "kimi_context_brain",
+  "mode": "live_loop_json_safe",
+  "symbols": [
+    "BTCUSDT",
+    "BNBUSDT",
+    "SOLUSDT",
+    "LINKUSDT",
+    "XAUUSDT",
+    "XAGUSDT"
+  ],
+  "market_regime": "unknown",
+  "risk": "medium",
+  "pairs": {
+    "BTCUSDT": {
+      "side": "SHORT",
+      "score": 5.0,
+      "confidence": 0.5,
+      "reason": "kimi fallback radar; safe advisory only; no direct order"
+    },
+    "BNBUSDT": {
+      "side": "LONG",
+      "score": 7.8,
+      "confidence": 0.78,
+      "reason": "kimi fallback radar; safe advisory only; no direct order"
+    },
+    "SOLUSDT": {
+      "side": "SHORT",
+      "score": 7.1,
+      "confidence": 0.71,
+      "reason": "kimi fallback radar; safe advisory only; no direct order"
+    },
+    "LINKUSDT": {
+      "side": "SHORT",
+      "score": 7.0,
+      "confidence": 0.7,
+      "reason": "kimi fallback radar; safe advisory only; no direct order"
+    },
+    "XAUUSDT": {
+      "side": "SHORT",
+      "score": 7.1,
+      "confidence": 0.71,
+      "reason": "kimi fallback radar; safe advisory only; no direct order"
+    },
+    "XAGUSDT": {
+      "side": "WAIT",
+      "score": 5.7,
+      "confidence": 0.5700000000000001,
+      "reason": "kimi fallback radar; safe advisory only; no direct order"
+    }
+  },
+  "warnings": {},
+  "status": "fallback",
+  "error": "HTTP Error 429: Too Many Requests",
+  "no_direct_order": true,
+  "source": "three_ai_hunter_service_v1b"
+}

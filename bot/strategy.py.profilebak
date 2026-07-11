@@ -1,0 +1,199 @@
+"""
+strategy.py (v10)  —  Profil SL/TP per-pair.
+MLSignalEngine (ml_signal.py) menggantikan rule-based ProScalperStrategy.
+File ini hanya menyediakan plan_levels() dan profile_for() untuk hitung
+jarak SL/TP yang tepat per-pair setelah ML mengkonfirmasi sinyal.
+"""
+from __future__ import annotations
+from dataclasses import dataclass
+
+
+@dataclass
+class Profile:
+    name: str
+    sl_mode: str        # "pct" atau "atr"
+    sl_pct: float       # dipakai kalau sl_mode=="pct"
+    atr_mult: float     # dipakai kalau sl_mode=="atr"
+    rr: float           # Risk:Reward (TP = sl_dist x rr)
+    order_type: str     # "market" atau "limit"
+    max_spread_pct: float
+
+
+# Profil per-pair (SL/TP pakai ATR untuk SOL karena lebih volatile)
+PROFILES = {
+    "btc":  Profile("BTC",  "pct", 0.008, 1.8, 2.0, "market", 0.0003),
+    "eth":  Profile("ETH",  "pct", 0.008, 1.8, 2.0, "market", 0.0004),
+    "bnb":  Profile("BNB",  "pct", 0.008, 1.5, 2.0, "market", 0.0006),
+    "sol":  Profile("SOL",  "atr", 0.008, 1.5, 2.0, "limit",  0.0010),
+    "doge": Profile("DOGE", "pct", 0.008, 1.5, 2.0, "limit",  0.0015),
+    "xrp":  Profile("XRP",  "pct", 0.008, 1.5, 2.0, "limit",  0.0008),
+    # v10: pair baru
+    "hype": Profile("HYPE", "atr", 0.010, 1.6, 2.0, "limit",  0.0020),
+    "link": Profile("LINK", "pct", 0.009, 1.5, 2.0, "limit",  0.0012),
+    # v12: pair baru (SUI/TIA volatil -> ATR; AVAX/APT -> pct)
+    "sui":  Profile("SUI",  "atr", 0.010, 1.6, 2.0, "limit",  0.0020),
+    "avax": Profile("AVAX", "pct", 0.009, 1.5, 2.0, "limit",  0.0012),
+    "apt":  Profile("APT",  "pct", 0.010, 1.5, 2.0, "limit",  0.0015),
+    "tia":  Profile("TIA",  "atr", 0.012, 1.7, 2.0, "limit",  0.0025),
+}
+
+PROFILE_MAP = {
+    "BTCUSDT":  "btc",
+    "ETHUSDT":  "eth",
+    "BNBUSDT":  "bnb",
+    "SOLUSDT":  "sol",
+    "DOGEUSDT": "doge",
+    "XRPUSDT":  "xrp",
+    "HYPEUSDT": "hype",
+    "LINKUSDT": "link",
+    "SUIUSDT":  "sui",
+    "AVAXUSDT": "avax",
+    "APTUSDT":  "apt",
+    "TIAUSDT":  "tia",
+}
+
+
+def profile_for(symbol: str) -> Profile:
+    key = PROFILE_MAP.get(symbol.upper().split("_")[0], "bnb")
+    return PROFILES[key]
+
+
+def rule_signal(klines: list, symbol: str) -> tuple[str, float]:
+    """
+    Rule-based fallback signal tanpa ML.
+    Return ("LONG"|"SHORT"|"HOLD", confidence)
+    Dipakai saat model ML belum tersedia.
+    """
+    import pandas as pd
+    import numpy as np
+
+    if not klines or len(klines) < 30:
+        return "HOLD", 0.0
+    try:
+        df = pd.DataFrame(klines)
+        close = pd.to_numeric(df.iloc[:, 4], errors="coerce").dropna()
+        vol   = pd.to_numeric(df.iloc[:, 5], errors="coerce").dropna()
+        if len(close) < 26:
+            return "HOLD", 0.0
+
+        base = symbol.upper().split("_")[0]
+
+        # ── Profil sinyal per-pair ──────────────────────────────────────────
+        if base == "BTCUSDT":
+            fast, slow, rsi_p = 9, 21, 14
+        elif base == "ETHUSDT":
+            fast, slow, rsi_p = 9, 21, 14
+        elif base == "SOLUSDT":
+            fast, slow, rsi_p = 5, 13, 9
+        elif base == "DOGEUSDT":
+            fast, slow, rsi_p = 21, 55, 14
+        elif base == "HYPEUSDT":
+            fast, slow, rsi_p = 5, 13, 9   # volatil -> reaktif
+        elif base == "LINKUSDT":
+            fast, slow, rsi_p = 9, 21, 14
+        else:  # BNB, XRP
+            fast, slow, rsi_p = 9, 21, 14
+
+        ema_f = close.ewm(span=fast,  adjust=False).mean()
+        ema_s = close.ewm(span=slow,  adjust=False).mean()
+
+        # RSI
+        delta = close.diff()
+        gain  = delta.clip(lower=0).ewm(span=rsi_p, adjust=False).mean()
+        loss  = (-delta.clip(upper=0)).ewm(span=rsi_p, adjust=False).mean()
+        rsi   = 100 - 100 / (1 + gain / loss.replace(0, 1e-9))
+
+        # ATR
+        high  = pd.to_numeric(df.iloc[:, 2], errors="coerce")
+        low   = pd.to_numeric(df.iloc[:, 3], errors="coerce")
+        tr    = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low  - close.shift()).abs()
+        ], axis=1).max(axis=1)
+        atr   = tr.ewm(span=14, adjust=False).mean()
+
+        # Volume filter
+        vol_ma  = vol.rolling(20).mean()
+        vol_ok  = float(vol.iloc[-1]) > float(vol_ma.iloc[-1]) * 1.2
+
+        ef = float(ema_f.iloc[-1]); ef1 = float(ema_f.iloc[-2])
+        es = float(ema_s.iloc[-1]); es1 = float(ema_s.iloc[-2])
+        rv = float(rsi.iloc[-1])
+        av = float(atr.iloc[-1])
+        price = float(close.iloc[-1])
+        atr_pct = av / price if price > 0 else 0
+
+        # Minimal volatility filter
+        if atr_pct < 0.001:
+            return "HOLD", 0.0
+
+        # Golden cross → LONG
+        if ef > es and ef1 <= es1 and rv < 65 and vol_ok:
+            conf = min(0.75, 0.55 + (rv / 100) * 0.2)
+            return "LONG", conf
+
+        # Death cross → SHORT
+        if ef < es and ef1 >= es1 and rv > 35 and vol_ok:
+            conf = min(0.75, 0.55 + ((100 - rv) / 100) * 0.2)
+            return "SHORT", conf
+
+        # Trend continuation
+        if ef > es and rv > 50 and rv < 70 and vol_ok:
+            return "LONG", 0.52
+        if ef < es and rv < 50 and rv > 30 and vol_ok:
+            return "SHORT", 0.52
+
+    except Exception:
+        pass
+    return "HOLD", 0.0
+
+
+def plan_levels(symbol: str, side: str, entry: float, atr_value: float,
+                min_tp_pct: float = 0.0, rr_override: float = 0.0) -> tuple[float, float, float]:
+    """
+    Hitung SL & TP berdasarkan profil pair.
+    rr_override > 0 -> pakai RR ini (v12 High-Conviction: perpanjang TP).
+    Return (sl_price, tp_price, sl_dist)
+    """
+    prof = profile_for(symbol)
+    if prof.sl_mode == "atr" and atr_value > 0:
+        dist = atr_value * prof.atr_mult
+    else:
+        dist = entry * prof.sl_pct
+    rr = rr_override if (rr_override and rr_override > 0) else prof.rr
+    tp_dist = dist * rr
+    if min_tp_pct > 0 and tp_dist < entry * min_tp_pct:
+        tp_dist = entry * min_tp_pct
+    if side.upper() == "LONG":
+        return entry - dist, entry + tp_dist, dist
+    return entry + dist, entry - tp_dist, dist
+
+
+def breakout_signal(klines: list, lookback: int = 20, vol_mult: float = 1.3) -> tuple[str, float]:
+    """v10.1 (B): Deteksi breakout momentum (Donchian-style) + konfirmasi volume.
+
+    Tangkap entry yang sering kelewat: harga menembus high/low N-candle terakhir
+    dengan lonjakan volume. Return ("LONG"|"SHORT"|"HOLD", strength 0..1).
+    """
+    try:
+        if not klines or len(klines) < lookback + 2:
+            return "HOLD", 0.0
+        highs  = [float(k[2]) for k in klines]
+        lows   = [float(k[3]) for k in klines]
+        closes = [float(k[4]) for k in klines]
+        vols   = [float(k[5]) for k in klines]
+        last_close = closes[-1]
+        prior_high = max(highs[-(lookback + 1):-1])
+        prior_low  = min(lows[-(lookback + 1):-1])
+        vol_ma     = sum(vols[-(lookback + 1):-1]) / max(1, lookback)
+        if vols[-1] <= vol_ma * vol_mult:
+            return "HOLD", 0.0   # tanpa lonjakan volume, breakout rawan palsu
+        rng = (prior_high - prior_low) or 1e-9
+        if last_close > prior_high:
+            return "LONG", round(min(1.0, 0.5 + (last_close - prior_high) / rng), 2)
+        if last_close < prior_low:
+            return "SHORT", round(min(1.0, 0.5 + (prior_low - last_close) / rng), 2)
+    except Exception:
+        pass
+    return "HOLD", 0.0

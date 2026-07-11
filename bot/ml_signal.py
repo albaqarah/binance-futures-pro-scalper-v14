@@ -1,0 +1,256 @@
+"""
+ml_signal.py  —  Wrapper prediksi LightGBM untuk bot live
+
+Cara kerja:
+  1. Load model pkl yang sudah dilatih dengan train.py
+  2. Tiap loop (3m/5m) ambil 60+ candle dari Binance
+  3. Hitung fitur pakai create_scalping_features
+  4. predict_signal → ("LONG" | "SHORT" | "HOLD", confidence)
+  5. Filter tambahan EMA distance + volume sebelum kirim order
+"""
+import os
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+try:
+    import joblib
+except ImportError:
+    raise SystemExit("Install dulu: pip install joblib")
+
+from .features import create_scalping_features, FEATURE_COLS
+
+# ── Konstanta ─────────────────────────────────────────────────────────────────
+PROBA_THRESHOLD = float(os.getenv("ML_PROBA_THRESHOLD", os.getenv("MIN_PROBA", "0.58")))  # minimum probabilitas untuk entry
+EMA_DIST_MIN = float(os.getenv("ML_EMA_DIST_MIN", "0.0004"))  # EMA distance minimum
+VOL_MULT_MIN = float(os.getenv("ML_VOL_MULT_MIN", "1.0"))  # volume candle minimum ratio
+
+# ML Soft Fallback:
+# Dipakai hanya saat normal ML HOLD.
+# Tujuan: tetap bisa ambil candidate saat market trend jelas tapi model kurang percaya.
+ML_SOFT_ENABLE = str(os.getenv("ML_SOFT_ENABLE", "false")).strip().lower() in ("1", "true", "yes", "y", "on")
+ML_SOFT_PROBA_MIN = float(os.getenv("ML_SOFT_PROBA_MIN", "0.44"))
+ML_SOFT_VOL_MIN = float(os.getenv("ML_SOFT_VOL_MIN", "0.20"))
+MODEL_DIR        = Path("models")  # relatif terhadap cwd saat bot jalan
+
+
+# ── Loader ────────────────────────────────────────────────────────────────────
+
+class MLSignalEngine:
+    """
+    Load dan cache model per-pair. Fallback ke model gabungan jika
+    model per-pair tidak ada.
+    """
+
+    def __init__(self, model_dir: str | Path = MODEL_DIR):
+        self._dir  = Path(model_dir)
+        self._cache: dict[str, dict] = {}
+        self._combo: Optional[dict]  = None
+        self._load_models()
+
+    def _load_models(self) -> None:
+        combo_path = self._dir / "lightgbm_bnb_sol_doge_xrp.pkl"
+        if combo_path.exists():
+            self._combo = joblib.load(combo_path)
+            print(f"[ML] Model gabungan dimuat: {combo_path}")
+        # v14: auto-discover SEMUA model per-pair (lgbm_<short>.pkl) tanpa hardcode.
+        # short = symbol.lower().replace('usdt','') -> konsisten dengan train.py.
+        # Ini bikin pair baru (LINK/XAU/XAG/dll) OTOMATIS kebaca modelnya, bukan
+        # cuma BNB/SOL/DOGE/XRP seperti versi sebelumnya.
+        for path in sorted(self._dir.glob("lgbm_*.pkl")):
+            short = path.stem[len("lgbm_"):]
+            if not short:
+                continue
+            base = f"{short.upper()}USDT"
+            try:
+                self._cache[base] = joblib.load(path)
+                print(f"[ML] Model {base} dimuat: {path}")
+            except Exception as e:
+                print(f"[ML] Gagal muat {path}: {e}")
+
+    def is_ready(self) -> bool:
+        return bool(self._combo or self._cache)
+
+    def _get_bundle(self, symbol: str) -> Optional[dict]:
+        # Pair dengan timeframe suffix (misal SOLUSDT_5m) → strip TF
+        base = symbol.upper().split("_")[0]
+        return self._cache.get(base) or self._combo
+
+    # ── Fungsi utama: predict sinyal live ─────────────────────────────────────
+
+    def predict_signal(
+        self,
+        klines: list,          # raw klines dari client.klines(sym, tf, 60)
+        symbol: str,
+        pair_label: str = "",  # label pair untuk feature (kosong = pakai symbol)
+    ) -> tuple[str, float]:
+        """
+        Input : klines list (format Binance: [ts,o,h,l,c,vol,...])
+        Output: ("LONG"|"SHORT"|"HOLD", confidence_proba)
+        """
+        bundle = self._get_bundle(symbol)
+        if bundle is None:
+            return "HOLD", 0.0
+
+        model = bundle["model"]
+        le    = bundle["label_encoder"]
+        feat_cols = bundle.get("feature_cols", FEATURE_COLS)
+
+        # Bangun DataFrame dari klines
+        df = _klines_to_df(klines)
+        if df is None or len(df) < 40:
+            return "HOLD", 0.0
+
+        # Hitung fitur — SAMA persis dengan saat training
+        try:
+            pname = pair_label or symbol
+            feat_df = create_scalping_features(df, pair=pname)
+        except Exception as e:
+            print(f"[ML] Feature error {symbol}: {e}")
+            return "HOLD", 0.0
+
+        if feat_df.empty:
+            return "HOLD", 0.0
+
+        # Ambil baris terakhir
+        missing = [c for c in feat_cols if c not in feat_df.columns]
+        if missing:
+            print(f"[ML] Fitur hilang {symbol}: {missing}")
+            return "HOLD", 0.0
+
+        X = feat_df[feat_cols].iloc[-1:].copy()
+        X = X.fillna(0)  # safety
+
+        # Prediksi probabilitas
+        proba = model.predict_proba(X)[0]  # shape: (n_classes,)
+        classes = list(le.classes_)        # misal [-1, 0, 1] setelah LabelEncoder
+
+        idx_long  = next((i for i,c in enumerate(classes) if float(c)==1.0),  None)
+        idx_short = next((i for i,c in enumerate(classes) if float(c)==-1.0), None)
+        prob_long  = float(proba[idx_long])  if idx_long  is not None else 0.0
+        prob_short = float(proba[idx_short]) if idx_short is not None else 0.0
+
+        # ── Ensemble: cek juga Random Forest ─────────────────────────────────
+        rf_model = bundle.get("rf_model")
+        rf_long = rf_short = 0.0
+        if rf_model is not None:
+            rf_proba  = rf_model.predict_proba(X)[0]
+            rf_long   = float(rf_proba[idx_long])  if idx_long  is not None else 0.0
+            rf_short  = float(rf_proba[idx_short]) if idx_short is not None else 0.0
+            # Rata-rata probabilitas LightGBM + RF
+            prob_long  = (prob_long  + rf_long)  / 2
+            prob_short = (prob_short + rf_short) / 2
+
+        # ── Filter tambahan: EMA distance + volume ───────────────────────────
+        last = feat_df.iloc[-1]
+        ema_dist  = abs(float(last.get("ema_dist_pct", 0)))
+        vol_ratio = float(last.get("vol_ratio", 0))
+        ema_ok  = ema_dist  > EMA_DIST_MIN
+        vol_ok  = vol_ratio > VOL_MULT_MIN
+        filters_pass = ema_ok and vol_ok
+
+        if prob_long > PROBA_THRESHOLD and filters_pass:
+            return "LONG",  float(prob_long)
+        if prob_short > PROBA_THRESHOLD and filters_pass:
+            return "SHORT", float(prob_short)
+
+        # ML SOFT fallback — bukan auto-entry, hanya kandidat awal.
+        # Tetap harus lolos confluence, AI, HARD-15M, FASTSCAN-MTF, dan guard lain.
+        try:
+            soft_vol_ok = vol_ratio >= ML_SOFT_VOL_MIN
+            soft_filters_pass = ema_ok and soft_vol_ok
+            if ML_SOFT_ENABLE and soft_filters_pass:
+                if prob_long >= ML_SOFT_PROBA_MIN and prob_long >= prob_short:
+                    try:
+                        import logging as _logging
+                        _logging.getLogger("pro-scalper").info(
+                            f"ML-SOFT LONG {symbol or pair_label}: proba={prob_long:.2f} "
+                            f"ema_dist={ema_dist:.5f} vol_ratio={vol_ratio:.2f}"
+                        )
+                    except Exception:
+                        pass
+                    return "LONG", float(prob_long)
+                if prob_short >= ML_SOFT_PROBA_MIN and prob_short > prob_long:
+                    try:
+                        import logging as _logging
+                        _logging.getLogger("pro-scalper").info(
+                            f"ML-SOFT SHORT {symbol or pair_label}: proba={prob_short:.2f} "
+                            f"ema_dist={ema_dist:.5f} vol_ratio={vol_ratio:.2f}"
+                        )
+                    except Exception:
+                        pass
+                    return "SHORT", float(prob_short)
+        except Exception:
+            pass
+        # ML HOLD reason logger — ringan, rate-limited per symbol.
+        try:
+            import time as _time
+            import logging as _logging
+            _now = _time.time()
+            if not hasattr(self, "_hold_log_ts"):
+                self._hold_log_ts = {}
+            _key = str(symbol or pair_label or "UNKNOWN")
+            _last = float(self._hold_log_ts.get(_key, 0) or 0)
+            if _now - _last >= 120:
+                _reason = []
+                if max(prob_long, prob_short) <= PROBA_THRESHOLD:
+                    _reason.append(f"proba {max(prob_long, prob_short):.2f}<={PROBA_THRESHOLD:.2f}")
+                if not ema_ok:
+                    _reason.append(f"ema_dist {ema_dist:.5f}<={EMA_DIST_MIN:.5f}")
+                if not vol_ok:
+                    _reason.append(f"vol_ratio {vol_ratio:.2f}<={VOL_MULT_MIN:.2f}")
+                if not _reason:
+                    _reason.append("no side passed")
+                _logging.getLogger("pro-scalper").info(
+                    f"ML HOLD {_key}: long={prob_long:.2f} short={prob_short:.2f} "
+                    f"ema_dist={ema_dist:.5f} vol_ratio={vol_ratio:.2f} | " + ", ".join(_reason)
+                )
+                self._hold_log_ts[_key] = _now
+        except Exception:
+            pass
+        return "HOLD", max(prob_long, prob_short)
+
+
+# ── Helper: klines → DataFrame ────────────────────────────────────────────────
+
+def _klines_to_df(klines: list) -> Optional[pd.DataFrame]:
+    """Konversi list klines Binance ke DataFrame OHLCV."""
+    if not klines or len(klines) < 10:
+        return None
+    try:
+        df = pd.DataFrame(klines, columns=[
+            "timestamp", "open", "high", "low", "close", "volume",
+            "close_time", "quote_vol", "trades", "taker_buy_base", "taker_buy_quote", "ignore"
+        ] if len(klines[0]) >= 12 else [
+            "timestamp", "open", "high", "low", "close", "volume"
+        ])
+        df = df[["timestamp", "open", "high", "low", "close", "volume"]].copy()
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", errors="coerce")
+        return df.dropna().reset_index(drop=True)
+    except Exception as e:
+        print(f"[ML] klines_to_df error: {e}")
+        return None
+
+
+# ── Fungsi standalone (kompatibel dengan contoh kode kamu) ────────────────────
+
+_default_engine: Optional[MLSignalEngine] = None
+
+
+def load_engine(model_dir: str | Path = MODEL_DIR) -> MLSignalEngine:
+    global _default_engine
+    _default_engine = MLSignalEngine(model_dir)
+    return _default_engine
+
+
+def predict_signal(klines: list, symbol: str,
+                   model_dir: str | Path = MODEL_DIR) -> tuple[str, float]:
+    """Shortcut fungsi tanpa instantiasi manual."""
+    global _default_engine
+    if _default_engine is None:
+        _default_engine = MLSignalEngine(model_dir)
+    return _default_engine.predict_signal(klines, symbol)

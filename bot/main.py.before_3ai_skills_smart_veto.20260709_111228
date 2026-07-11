@@ -1,0 +1,1926 @@
+from __future__ import annotations
+import json, re, time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .config import Settings
+from .exchange_binance import BinanceFuturesClient
+from .indicators import stoch_rsi, atr
+from .logger import setup_logger
+from .ml_signal import MLSignalEngine
+from .sentiment import get_fear_greed, log_sentiment
+from .telegram_notif import get_notifier
+from .session_filter import is_trading_session
+from .orderbook import get_imbalance, orderbook_confirms
+from .mtf import get_htf_trend, mtf_confirms
+from .pnl import summarize_income
+from .risk import calc_entry_from_free_margin, calc_breakeven_sl, profit_pct
+from .strategy import profile_for, plan_levels, rule_signal, breakout_signal
+from .orderflow import analyze_orderflow
+from .execution import dynamic_atr_tpsl, maker_price, split_iceberg
+from .volatility import squeeze_signal
+from .positioning import positioning_signal
+from .mode_selector import gate_ok
+from .mode_selector import pivot_trail_sl
+from .mode_selector import PAIR_CD_ENABLE, PAIR_CD_LOSS, PAIR_CD_WIN, GLOBAL_CD_ENABLE
+from .mode_selector import APLUS_OVERRIDE, APLUS_CONF
+from .trade_journal import log_trade, session_threshold_adjust
+from . import dashboard
+
+STATE_FILE = Path("logs/state.json")
+NEWS_BIAS_FILE = Path("logs/news_bias.json")
+NEWS_HUNT_FILE = Path("logs/news_hunt.json")
+TRADE_MEMORY_FILE = Path("logs/trade_memory.json")
+REGIME_FILE = Path("logs/regime.json")
+
+
+def load_news_bias(settings):
+    """v10: Baca arah bias berita dari AI Agent (logs/news_bias.json).
+
+    Return ("long"|"short"|"neutral", info_dict).
+    AI Agent menulis file ini tiap interval; bot membacanya untuk
+    memfilter arah signal (berita buruk -> hanya SHORT, baik -> hanya LONG).
+    """
+    import json as _json, time as _time
+    try:
+        if not getattr(settings, "news_bias_enable", True):
+            return "neutral", {}
+        if not NEWS_BIAS_FILE.exists():
+            return "neutral", {}
+        data = _json.loads(NEWS_BIAS_FILE.read_text())
+        ttl  = float(getattr(settings, "news_bias_ttl_seconds", 10800))
+        ts   = float(data.get("ts", 0))
+        if ttl > 0 and (_time.time() - ts) > ttl:
+            return "neutral", data  # kadaluarsa
+        bias = str(data.get("bias", "neutral")).lower()
+        if bias not in ("long", "short", "neutral"):
+            bias = "neutral"
+        return bias, data
+    except Exception:
+        return "neutral", {}
+
+
+
+
+
+
+def _env_float_runtime(key, default):
+    try:
+        import os as _os
+        return float(_os.getenv(key, str(default)))
+    except Exception:
+        return float(default)
+
+def _env_bool_runtime(key, default=False):
+    try:
+        import os as _os
+        v = str(_os.getenv(key, str(default))).strip().lower()
+        return v in ("1", "true", "yes", "y", "on")
+    except Exception:
+        return bool(default)
+
+def _env_int_runtime(key, default):
+    try:
+        import os as _os
+        return int(float(_os.getenv(key, str(default))))
+    except Exception:
+        return int(default)
+
+
+def _profit_brain_load_memory():
+    try:
+        import json as _json, time as _time
+        if not TRADE_MEMORY_FILE.exists(): return {}
+        data=_json.loads(TRADE_MEMORY_FILE.read_text())
+        now=_time.time(); changed=False
+        for sym in list(data.keys()):
+            sides=data.get(sym,{})
+            if not isinstance(sides,dict):
+                data.pop(sym,None); changed=True; continue
+            for side in list(sides.keys()):
+                item=sides.get(side,{})
+                if not isinstance(item,dict) or float(item.get("expires_at",0) or 0)<now:
+                    sides.pop(side,None); changed=True
+            if not sides:
+                data.pop(sym,None); changed=True
+        if changed:
+            TRADE_MEMORY_FILE.parent.mkdir(exist_ok=True)
+            TRADE_MEMORY_FILE.write_text(_json.dumps(data))
+        return data
+    except Exception:
+        return {}
+
+def _profit_brain_save_memory(data):
+    try:
+        import json as _json
+        TRADE_MEMORY_FILE.parent.mkdir(exist_ok=True)
+        TRADE_MEMORY_FILE.write_text(_json.dumps(data))
+    except Exception:
+        pass
+
+def _profit_brain_classify_loss(sym,side,pnl,roi):
+    try: roi=float(roi or 0)
+    except Exception: roi=0.0
+    sym=str(sym).upper(); side=str(side).upper()
+    if roi<=-7:
+        return "long_failed_full_sl" if side=="LONG" else "short_failed_full_sl"
+    if sym in {"LINKUSDT","SOLUSDT"}: return "choppy_pair_whipsaw"
+    if sym in {"XAUUSDT","XAGUSDT"}: return "volatile_news_pair"
+    return "recent_same_side_loss"
+
+def _profit_brain_penalty_from_loss(pnl,roi):
+    try: roi=float(roi or 0)
+    except Exception: roi=0.0
+    if roi<=-7: return 0.3,0.3,7200
+    if roi<=-3: return 0.2,0.2,3600
+    return 0.1,0.1,1800
+
+def _profit_brain_update_from_log(lookback_lines=900):
+    try:
+        import re as _re, time as _time
+        from pathlib import Path as _Path
+        lf=_Path("logs/bot.log")
+        if not lf.exists(): return
+        lines=lf.read_text(errors="ignore").splitlines()[-int(lookback_lines):]
+        mem=_profit_brain_load_memory(); now=_time.time()
+        pat=_re.compile(r"Position\s+([A-Z0-9]+)\s+(LONG|SHORT)\s+closed.*realized\s+(-?[0-9.]+)\s+USDT\s+\((-?[0-9.]+)%",_re.I)
+        changed=False
+        for line in lines:
+            m=pat.search(line)
+            if not m: continue
+            sym=m.group(1).upper(); side=m.group(2).upper(); pnl=float(m.group(3)); roi=float(m.group(4))
+            if pnl>=0:
+                if sym in mem and side in mem.get(sym,{}):
+                    mem[sym].pop(side,None)
+                    if not mem[sym]: mem.pop(sym,None)
+                    changed=True
+                continue
+            pen,req,ttl=_profit_brain_penalty_from_loss(pnl,roi)
+            reason=_profit_brain_classify_loss(sym,side,pnl,roi)
+            old=(mem.get(sym,{}) or {}).get(side,{}) or {}
+            repeat=int(old.get("repeat",0) or 0)+1
+            if repeat>=2:
+                pen=min(0.4,pen+0.1); req=min(0.4,req+0.1); ttl=max(ttl,10800)
+            mem.setdefault(sym,{})[side]={"last_loss_ts":now,"symbol":sym,"side":side,"pnl":pnl,"roi":roi,"reason":reason,"penalty":round(pen,2),"extra_req":round(req,2),"repeat":repeat,"expires_at":now+ttl,"ttl_seconds":ttl,"mode":"soft_extra_confirm_not_hard_block"}
+            changed=True
+        if changed: _profit_brain_save_memory(mem)
+    except Exception:
+        pass
+
+def _profit_brain_get_lesson(sym,side):
+    try:
+        import time as _time
+        mem=_profit_brain_load_memory()
+        item=((mem.get(str(sym).upper(),{}) or {}).get(str(side).upper(),{}) or {})
+        if not item: return None
+        if float(item.get("expires_at",0) or 0)<_time.time(): return None
+        return item
+    except Exception:
+        return None
+
+
+def _recent_loss_same_side(sym, side, lookback_lines=600, ttl_seconds=10800):
+    """Learning memory ringan:
+    Cek log terakhir apakah symbol+side baru loss.
+    Kalau iya, next same-side signal diberi penalti sementara.
+    """
+    try:
+        import re as _re, time as _time
+        from pathlib import Path as _Path
+
+        lf = _Path("logs/bot.log")
+        if not lf.exists():
+            return False, ""
+
+        lines = lf.read_text(errors="ignore").splitlines()[-int(lookback_lines):]
+        pat = _re.compile(
+            r"Position\s+([A-Z0-9]+)\s+(LONG|SHORT)\s+closed.*realized\s+(-?[0-9.]+)",
+            _re.I
+        )
+
+        for line in reversed(lines):
+            m = pat.search(line)
+            if not m:
+                continue
+
+            lsym = m.group(1).upper()
+            lside = m.group(2).upper()
+            pnl = float(m.group(3))
+
+            if lsym == str(sym).upper() and lside == str(side).upper() and pnl < 0:
+                return True, f"recent {lsym} {lside} loss {pnl}"
+            if lsym == str(sym).upper() and pnl > 0:
+                # Kalau pair yang sama sudah profit setelah loss, memory dianggap membaik.
+                return False, ""
+
+        return False, ""
+    except Exception:
+        return False, ""
+
+
+def load_news_hunt(settings):
+    try:
+        import json as _json, time as _time
+        if not NEWS_HUNT_FILE.exists():
+            return {"mode":"normal","risk":"neutral","hot_pairs":[],"signals":[]}
+        data=_json.loads(NEWS_HUNT_FILE.read_text())
+        ttl=float(data.get("ttl",1800)); ts=float(data.get("ts",0))
+        if ts and (_time.time()-ts>ttl):
+            return {"mode":"normal","risk":"expired","hot_pairs":[],"signals":[]}
+        data["hot_pairs"]=data.get("hot_pairs",[]) if isinstance(data.get("hot_pairs",[]),list) else []
+        data["signals"]=data.get("signals",[]) if isinstance(data.get("signals",[]),list) else []
+        return data
+    except Exception:
+        return {"mode":"normal","risk":"error","hot_pairs":[],"signals":[]}
+
+def _news_hunt_for_symbol(news_hunt,sym):
+    try:
+        for x in (news_hunt or {}).get("hot_pairs",[]) or []:
+            if str(x.get("symbol","")).upper().strip()==str(sym).upper().strip():
+                return x
+    except Exception:
+        pass
+    return None
+
+def _news_hunt_signal_for_symbol(news_hunt,sym):
+    try:
+        best=None
+        for x in (news_hunt or {}).get("signals",[]) or []:
+            if str(x.get("symbol","")).upper().strip()!=str(sym).upper().strip():
+                continue
+            conf=float(x.get("confidence",0) or 0)
+            if best is None or conf>float(best.get("confidence",0) or 0):
+                best=x
+        return best
+    except Exception:
+        return None
+
+
+def load_regime(settings):
+    """v10.1 (G): Baca regime pasar dari AI Agent (logs/regime.json).
+
+    Return (regime_str, info_dict). info_dict bisa berisi override:
+    confluence_min_score, cooldown_after_trade_seconds, cooldown_after_loss_seconds.
+    """
+    import json as _json, time as _time
+    if not getattr(settings, "regime_enable", True):
+        return "unknown", {}
+    try:
+        if not REGIME_FILE.exists():
+            return "unknown", {}
+        data = _json.loads(REGIME_FILE.read_text())
+        ttl  = float(getattr(settings, "regime_ttl_seconds", 7200))
+        ts   = float(data.get("ts", 0))
+        if ttl > 0 and (_time.time() - ts) > ttl:
+            return "unknown", {}  # kadaluarsa
+        return str(data.get("regime", "unknown")), data
+    except Exception:
+        return "unknown", {}
+
+
+def _binance_code(err):
+    m = re.search(r'"code"\s*:\s*(-?\d+)', str(err))
+    return m.group(1) if m else "?"
+
+
+def load_state():
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {"last_trade_ts": 0, "daily_trades": 0, "day": "", "breakeven_done": {}, "last_trade_per_pair": {}}
+
+
+def save_state(state):
+    STATE_FILE.parent.mkdir(exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state))
+
+
+DASH_FILE = Path("logs/dashboard_state.json")
+EQ_FILE   = Path("logs/equity_history.json")
+
+
+def write_web_snapshot(view_dict):
+    """Tulis snapshot JSON untuk Web Dashboard (GANAS UI)."""
+    try:
+        d = view_dict.get("daily")
+        daily = {}
+        if d is not None:
+            daily = {"net": round(d.net, 4), "trades": d.trades, "wins": d.wins,
+                     "losses": d.losses, "win_rate": round(d.win_rate, 2)}
+        snap = dict(view_dict)
+        snap["daily"] = daily
+        DASH_FILE.parent.mkdir(exist_ok=True)
+        DASH_FILE.write_text(json.dumps(snap, default=str))
+        # Equity history (maks 240 titik)
+        equity = view_dict.get("margin_balance") or view_dict.get("wallet") or 0.0
+        hist = []
+        if EQ_FILE.exists():
+            try: hist = json.loads(EQ_FILE.read_text())
+            except Exception: hist = []
+        now_t = datetime.now().strftime("%H:%M")
+        if not hist or hist[-1].get("t") != now_t:
+            hist.append({"t": now_t, "equity": round(float(equity), 4)})
+            hist = hist[-240:]
+            EQ_FILE.write_text(json.dumps(hist))
+    except Exception:
+        pass
+
+
+def _today():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _round_trip_fee_usdt(settings, entry, qty):
+    """v12 (10): Estimasi fee pulang-pergi (USDT) — entry + exit taker."""
+    try:
+        return abs(float(entry) * float(qty)) * float(settings.taker_fee_pct) * 2.0
+    except Exception:
+        return 0.0
+
+
+def _hc_for(state, sym):
+    """v12 (7): Metadata High-Conviction per-symbol (tp_mult/trail/partial)."""
+    return (state.get("hc_meta", {}) or {}).get(sym, {})
+
+
+# v14: TradFi Perps (XAU/XAG) TIDAK 24/7. Buka ~ Minggu 22:00 UTC s/d Jumat 21:00 UTC,
+# dengan jeda harian 21:00-22:00 UTC & Sabtu tutup penuh. Bot skip pair TradFi saat tutup
+# biar gak entry pas gap/likuiditas kering.
+def tradfi_market_open(now_utc=None) -> bool:
+    from datetime import datetime as _dt, timezone as _tz
+    now = now_utc or _dt.now(_tz.utc)
+    wd, h = now.weekday(), now.hour        # Senin=0 .. Minggu=6
+    if wd == 5:                             # Sabtu: tutup penuh
+        return False
+    if wd == 6 and h < 22:                  # Minggu sebelum 22:00 UTC
+        return False
+    if wd == 4 and h >= 21:                 # Jumat sesudah 21:00 UTC
+        return False
+    if h == 21:                             # jeda maintenance harian 21:00-22:00 UTC
+        return False
+    return True
+
+
+
+def _tradfi_scout_env_bool(key, default=False):
+    try:
+        import os as _os
+        v = str(_os.getenv(key, str(default))).strip().lower()
+        return v in ("1", "true", "yes", "y", "on")
+    except Exception:
+        return bool(default)
+
+def _tradfi_scout_env_float(key, default):
+    try:
+        import os as _os
+        return float(_os.getenv(key, str(default)))
+    except Exception:
+        return float(default)
+
+
+def is_tradfi_symbol(sym, settings) -> bool:
+    return sym.upper() in {s.upper() for s in (getattr(settings, "tradfi_symbols", None) or [])}
+
+
+def main():
+    settings  = Settings()
+    log       = setup_logger(settings)
+    client    = BinanceFuturesClient(settings)
+    state     = load_state()
+    state.setdefault("breakeven_done", {})
+    tf0       = settings.timeframes[0]
+
+    # v12 (10): Fee-aware minimum TP — pastikan TP menutup fee pulang-pergi + profit bersih minimal.
+    eff_min_tp = settings.min_tp_pct
+    if settings.fee_aware_tp:
+        eff_min_tp = max(eff_min_tp, settings.taker_fee_pct * 2.0 + settings.min_net_profit_pct)
+
+    # Load LightGBM model
+    ml_engine = MLSignalEngine(settings.ml_model_dir)
+    ml_ready  = ml_engine.is_ready()
+    if not ml_ready:
+        log.warning(
+            "[ML] No model yet. Falling back to rule-based. "
+            "Run 'python3 setup_and_train.py' to upgrade to ML."
+        )
+
+    # Telegram notifier
+    tg = get_notifier(settings.telegram_token, settings.telegram_chat_id)
+    if tg.enabled:
+        tg.alert(f"\u26a1 Bot v14 START | {tf0} | {'DRY-RUN' if settings.dry_run else 'LIVE'}")
+        log.info("[TG] Telegram notifications active")
+
+    # Fear & Greed sentiment — refresh tiap jam otomatis
+    _sentiment = get_fear_greed()
+    _sent_ts   = time.time()
+    log.info(log_sentiment(_sentiment))
+
+    # v10: AI News-Directional Bias (berita buruk -> SHORT, baik -> LONG)
+    _news_bias, _nb_info = load_news_bias(settings)
+    _news_hunt = load_news_hunt(settings)
+    if _news_hunt.get("mode") == "hunt":
+        log.info("[NEWS-HUNT] Active: risk=%s | hot_pairs=%s | scout_signals=%s", _news_hunt.get("risk","neutral"), len(_news_hunt.get("hot_pairs",[]) or []), len(_news_hunt.get("signals",[]) or []))
+    if _news_bias != "neutral":
+        log.info("[NEWS-BIAS] Active: direction %s | info=%s", _news_bias.upper(), _nb_info.get("summary", ""))
+
+    # v10.1: regime pasar (default unknown sampai AI Agent menulis logs/regime.json)
+    _regime = "unknown"
+
+    events: list[str] = []
+    screen_rows: list[dict] = []
+    bal_state: dict = {"wallet": 0.0, "available": 0.0, "margin_balance": 0.0, "upnl": 0.0}
+
+    def event(msg, level="info"):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        events.append(f"{stamp} {msg}")
+        del events[:-12]
+        getattr(log, level, log.info)(msg)
+
+    def view(free, daily, positions=None):
+        return {
+            "dry_run": settings.dry_run, "testnet": settings.use_testnet,
+            "leverage": settings.leverage, "timeframes": ",".join(settings.timeframes),
+            "symbols": list(settings.symbols),
+            "use_macd": False, "use_orderbook": False,
+            "entry_pct": settings.entry_margin_pct, "free": free,
+            "wallet": bal_state["wallet"], "available": bal_state["available"],
+            "margin_balance": bal_state["margin_balance"], "upnl_acct": bal_state["upnl"],
+            "max_positions": settings.max_open_positions,
+            "daily": daily, "positions": positions or [], "screen": screen_rows, "events": events,
+            "sentiment": _sentiment,
+            "news_bias": _news_bias,
+            "regime": _regime,
+        }
+
+    def refresh_dashboard(free, daily, positions=None):
+        v = view(free, daily, positions)
+        write_web_snapshot(v)
+        if settings.dashboard:
+            dashboard.show(v)
+
+    off = client.sync_time()
+    event(f"Pro Scalper v14 start | {tf0} | {'SCALP' if settings.scalp_mode else 'NORMAL'} | mode={'DRY-RUN' if settings.dry_run else 'LIVE'} | net={'TESTNET' if settings.use_testnet else 'REAL'} | clock {off}ms")
+    for sym in settings.symbols:
+        try:
+            client.set_leverage(sym, settings.leverage)
+        except Exception as e:
+            event(f"set leverage {sym} failed: {e}", "warning")
+
+    while True:
+        try:
+            client.sync_time()
+            if state.get("day") != _today():
+                state["day"] = _today(); state["daily_trades"] = 0; state["breakeven_done"] = {}
+                save_state(state)
+
+            # v10: refresh arah bias berita dari AI Agent tiap loop
+            _news_bias, _nb_info = load_news_bias(settings)
+
+            # v10.1 (G): regime pasar -> auto-tuning threshold & cooldown
+            _regime, _rg_info = load_regime(settings)
+            eff_conf_min = settings.confluence_min_score
+            eff_cd_trade = settings.cooldown_after_trade_seconds
+            eff_cd_loss  = settings.cooldown_after_loss_seconds
+            try:
+                if _rg_info.get("confluence_min_score") is not None:
+                    eff_conf_min = max(settings.confluence_min_floor,
+                                       min(settings.confluence_min_ceil,
+                                           float(_rg_info["confluence_min_score"])))
+                if _rg_info.get("cooldown_after_trade_seconds") is not None:
+                    eff_cd_trade = int(_rg_info["cooldown_after_trade_seconds"])
+                if _rg_info.get("cooldown_after_loss_seconds") is not None:
+                    eff_cd_loss = int(_rg_info["cooldown_after_loss_seconds"])
+            except Exception:
+                pass
+
+            # v11 (4): Session-adaptive threshold (belajar dari winrate per jam WIB)
+            if settings.session_adaptive_enable:
+                try:
+                    _sa = session_threshold_adjust()
+                    if _sa:
+                        eff_conf_min = max(settings.confluence_min_floor,
+                                           min(settings.confluence_min_ceil, eff_conf_min + _sa))
+                except Exception:
+                    pass
+
+            try:
+                bal_state.update(client.get_balances())
+            except Exception as e:
+                event(f"Fetch balance failed (code {_binance_code(e)}): {e}", "warning")
+            free = bal_state["available"]
+
+            try:
+                daily = summarize_income(client.income_today())
+            except Exception:
+                daily = summarize_income([])
+
+            open_pos = client.open_positions()
+
+            # ── v10 FIX: notif posisi yang ditutup SL/TP di sisi Binance ──
+            # Bot cuma kirim notif saat ia menutup sendiri; kalau SL/TP exchange yang
+            # mengeksekusi, posisi hilang diam-diam. Di sini kita deteksi & kirim WIN/LOSS.
+            try:
+                _cur_syms  = {p.get("symbol") for p in open_pos}
+                _prev_held = state.get("held_syms", {}) or {}
+                _gone = [x for x in _prev_held if x not in _cur_syms]
+                if _gone and not settings.dry_run:
+                    _inc = client.income_today()
+                    for _s in _gone:
+                        _info  = _prev_held.get(_s) or {}
+                        _ts    = float(_info.get("ts", time.time()))
+                        _mgn   = float(_info.get("margin", 0.0))
+                        _pside = _info.get("side", "?")
+                        _real  = sum(
+                            float(r.get("income", 0) or 0)
+                            for r in _inc
+                            if r.get("symbol") == _s
+                            and str(r.get("incomeType", "")).upper() in ("REALIZED_PNL", "COMMISSION", "FUNDING_FEE")
+                            and int(r.get("time", 0) or 0) >= int(_ts * 1000) - 3000
+                        )
+                        _roi = (_real / _mgn * 100.0) if _mgn > 0 else 0.0
+                        _dur = int((time.time() - _ts) / 60)
+                        if _real >= 0:
+                            tg.close_win(_s, _pside, _real, _roi, _dur)
+                        else:
+                            tg.close_loss(_s, _pside, _real, _roi, _dur)
+                            state["last_loss_ts"] = time.time()
+                            state.setdefault("last_loss_per_pair", {})[_s] = time.time()
+                        state["last_trade_ts"] = time.time()
+                        state.setdefault("last_close_per_pair", {})[_s] = time.time()
+                        event(f"Position {_s} {_pside} closed (SL/TP Binance) | realized {_real:+.4f} USDT ({_roi:+.2f}%)")
+                        # v12 FIX bug #2: posisi ditutup exchange -> sisa order (SL/TP lawan)
+                        # masih nyangkut. Bersihkan otomatis biar gak perlu cancel manual.
+                        try:
+                            _cxl = client.cancel_all_algo_orders(_s)
+                            if _cxl:
+                                event(f"\U0001f9f9 Cleaned {_cxl} leftover order(s) for {_s} after position closed")
+                        except Exception as _ce:
+                            event(f"Failed to cancel leftover order {_s}: {_ce}", "warning")
+                        state.setdefault("held_syms", {}).pop(_s, None)
+                        if settings.journal_enable:
+                            try:
+                                from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+                                _wib = _tz(_td(hours=7))
+                                log_trade({
+                                    "ts": time.time(),
+                                    "datetime_wib": _dt.now(_wib).strftime("%Y-%m-%d %H:%M"),
+                                    "symbol": _s, "side": _pside,
+                                    "realized": round(_real, 4), "roi_pct": round(_roi, 2),
+                                    "duration_min": _dur,
+                                    "result": "win" if _real >= 0 else "loss",
+                                    "score": (_info.get("score", "") if isinstance(_info, dict) else ""),
+                                    "regime": _regime, "news_bias": _news_bias,
+                                    "reason": "SL/TP Binance",
+                                })
+                            except Exception as _je:
+                                event(f"Journal failed: {_je}", "warning")
+                    save_state(state)
+            except Exception as e:
+                event(f"Closed-position detection failed: {e}", "warning")
+
+            # -------- kelola posisi terbuka (Force-TP / SL+ / penjaga) --------
+            positions_view = []
+            closed_any = False
+            for p in open_pos:
+                amt = float(p.get("positionAmt", 0) or 0)
+                if amt == 0:
+                    continue
+                side  = "LONG" if amt > 0 else "SHORT"
+                entry = float(p.get("entryPrice", 0) or 0)
+                sym   = p.get("symbol", "?")
+                mark  = client.mark_price(sym)
+                up    = float(p.get("unRealizedProfit", 0) or 0)
+                pp    = profit_pct(side, entry, mark)
+                roi   = pp * settings.leverage
+                be_done = bool(state.get("breakeven_done", {}).get(sym))
+
+                closes_pos: list[float] = []
+                atr_pos = 0.0
+                try:
+                    kl_pos  = client.klines(sym, tf0, 80)
+                    highs_p = [float(k[2]) for k in kl_pos]
+                    lows_p  = [float(k[3]) for k in kl_pos]
+                    closes_pos = [float(k[4]) for k in kl_pos]
+                    atr_pos = atr(highs_p, lows_p, closes_pos, 14)
+                except Exception:
+                    pass
+
+                # --- TP Paksa StochRSI (hanya saat HIJAU & NET positif setelah fee) ---
+                _fee_rt = _round_trip_fee_usdt(settings, entry, abs(amt))
+                _min_net_usdt = (entry * abs(amt)) * settings.min_net_profit_pct if settings.fee_aware_tp else 0.0
+                if settings.force_tp_enable and up > (_fee_rt + _min_net_usdt) and pp >= settings.force_tp_min_profit_pct and closes_pos:
+                    try:
+                        sk, _ = stoch_rsi(closes_pos)
+                        hit = (
+                            (side == "LONG"  and sk >= settings.force_tp_stoch_long)
+                            or (side == "SHORT" and sk <= settings.force_tp_stoch_short)
+                        )
+                        if hit:
+                            client.cancel_all_algo_orders(sym)
+                            client.close_position_market(sym, side, abs(amt))
+                            state["last_trade_ts"] = time.time()
+                            state.setdefault("breakeven_done", {}).pop(sym, None)
+                            state.setdefault("partial_done", {}).pop(sym, None)
+                            # Hitung durasi SEBELUM pop entry_time (Fix Bug order)
+                            _dur = int((time.time() - state.get("entry_time", {}).get(sym, time.time())) / 60)
+                            state.setdefault("entry_time", {}).pop(sym, None)
+                            state.setdefault("held_syms", {}).pop(sym, None)
+                            _net = (up - _fee_rt) if settings.report_net_pnl else up
+                            _margin = (entry * abs(amt) / max(1, settings.leverage)) if (entry and amt) else 0.0
+                            _net_roi = (_net / _margin * 100.0) if _margin > 0 else roi * 100
+                            if _net >= 0:
+                                tg.close_win(sym, side, _net, _net_roi, _dur)
+                            else:
+                                tg.close_loss(sym, side, _net, _net_roi, _dur)
+                                state["last_loss_ts"] = time.time()
+                            save_state(state)
+                            event(f"FORCE TP {side} {sym}: StochRSI %K={sk:.1f}, ROI {roi:+.2f}% locked")
+                            closed_any = True
+                            continue
+                    except Exception as e:
+                        event(f"Force-TP check {sym}: {e}", "warning")
+
+                # --- penjaga SL/TP (pastikan proteksi aktif) ---
+                try:
+                    algo    = client.open_algo_orders(sym)
+                    has_sl  = any("STOP" in str(o.get("type") or o.get("strategyType") or "").upper()
+                                  and "TAKE_PROFIT" not in str(o.get("type") or "").upper() for o in algo)
+                    has_tp  = any("TAKE_PROFIT" in str(o.get("type") or o.get("strategyType") or "").upper() for o in algo)
+                    g_sl, g_tp, _ = plan_levels(sym, side, entry, atr_pos, eff_min_tp, _hc_for(state, sym).get("tp_mult", 0.0))
+
+                    # -------- Early SL+ Profit Lock --------
+                    # ROI +1.5% -> lock SL ke profit aman. Tidak close posisi, biarkan lanjut kalau trend kuat.
+                    try:
+                        _slp_trigger = _env_float_runtime("SLPLUS_TRIGGER_ROI", 1.5)
+                        _slp_lock = _env_float_runtime("SLPLUS_LOCK_ROI", 0.6)
+
+                        _entry_px = float(entry or 0)
+                        _amt_abs = abs(float(amt or 0))
+                        _mark_px = float(p.get("markPrice", 0) or p.get("entryPrice", 0) or 0)
+                        if not _mark_px:
+                            _mark_px = _entry_px
+
+                        _roi_now = 0.0
+                        try:
+                            _margin_est = max(float(p.get("initialMargin", 0) or 0), float(p.get("positionInitialMargin", 0) or 0))
+                            if _margin_est > 0:
+                                _roi_now = (float(up or 0) / _margin_est) * 100.0
+                            else:
+                                _notional_est = max(_entry_px * _amt_abs, 1e-9)
+                                _lev_est = float(getattr(settings, "leverage", 10) or 10)
+                                _roi_now = (float(up or 0) / max(_notional_est / max(_lev_est, 1), 1e-9)) * 100.0
+                        except Exception:
+                            _roi_now = 0.0
+
+                        _slp_key = f"{sym}:{side}:{round(_entry_px, 8)}:{round(abs(amt), 8)}:early_slplus"
+                        _slp_done = bool(state.setdefault("early_slplus_done", {}).get(_slp_key))
+
+                        if (not _slp_done) and _entry_px > 0 and _roi_now >= _slp_trigger:
+                            rules = client.trade_rules(sym)
+                            _tick = rules.get("tick_size", 0) or 0
+
+                            # ROI futures dihitung terhadap margin.
+                            # Lock ROI 0.6% di leverage 10x ~= price lock 0.06% dari entry.
+                            _lev_est = float(getattr(settings, "leverage", 10) or 10)
+                            _price_lock_pct = (_slp_lock / max(_lev_est, 1)) / 100.0
+
+                            if side == "LONG":
+                                _new_sl = _entry_px * (1.0 + _price_lock_pct)
+                            else:
+                                _new_sl = _entry_px * (1.0 - _price_lock_pct)
+
+                            try:
+                                _new_sl = round_step(_new_sl, _tick, rules.get("min_price", 0) or 0)
+                            except Exception:
+                                pass
+
+                            try:
+                                for _o in client.open_orders(sym):
+                                    if "STOP" in str(_o.get("type","")).upper() and "TAKE" not in str(_o.get("type","")).upper():
+                                        try:
+                                            client.cancel_order(sym, _o.get("orderId"))
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+
+                            try:
+                                client.stop_loss_order(
+                                    sym,
+                                    side,
+                                    _new_sl,
+                                    _amt_abs
+                                )
+                                state["early_slplus_done"][_slp_key] = True
+                                state.setdefault("slplus_reentry", {})[sym] = {
+                                    "side": side,
+                                    "ts": time.time(),
+                                    "reason": "early_slplus_lock",
+                                    "reentry_enable": _env_bool_runtime("REENTRY_AFTER_SLPLUS_ENABLE", True),
+                                    "cooldown": _env_int_runtime("REENTRY_COOLDOWN_SEC", 90)
+                                }
+                                save_state(state)
+                                event(f"EARLY SL+ {sym}: ROI {_roi_now:+.2f}% -> lock {_slp_lock:.2f}% ROI @ {_new_sl}")
+                            except Exception as _slpe:
+                                event(f"EARLY SL+ failed {sym}: {_slpe}", "warning")
+
+                    except Exception as _slp_outer:
+                        event(f"EARLY SL+ guard error {sym}: {_slp_outer}", "warning")
+
+
+                    if be_done:
+                        g_sl = calc_breakeven_sl(side, entry, settings.breakeven_lock_roi / max(1, settings.leverage))
+                    if not has_sl:
+                        client.stop_loss_order(sym, side, g_sl, abs(amt))
+                        event(f"Re-set SL {sym} @ {client.round_price(sym, g_sl)}")
+                    if not has_tp:
+                        client.take_profit_order(sym, side, g_tp, abs(amt))
+                        event(f"Re-set TP {sym} @ {client.round_price(sym, g_tp)}")
+                except Exception as e:
+                    event(f"Re-setting SL/TP {sym} failed: {e}", "warning")
+
+                # --- SL+ berbasis ROI ---
+                if settings.breakeven_enable and not be_done and roi >= settings.breakeven_trigger_roi:
+                    try:
+                        cancelled = client.cancel_stop_loss_orders(sym)
+                        lock_pct  = settings.breakeven_lock_roi / max(1, settings.leverage)
+                        new_sl    = calc_breakeven_sl(side, entry, lock_pct)
+                        client.stop_loss_order(sym, side, new_sl, abs(amt))
+                        state.setdefault("breakeven_done", {})[sym] = True
+                        save_state(state); be_done = True
+                        event(f"SL+ {sym}: ROI {roi:+.2f}% -> lock +{settings.breakeven_lock_roi*100:.0f}% ROI (cancelled {cancelled} old SL)")
+                        tg.breakeven(sym, roi * 100)
+                    except Exception as e:
+                        event(f"SL+ {sym} failed: {e}", "warning")
+
+                # --- Trailing Stop Loss ---
+                if (settings.trailing_sl_enable and be_done
+                        and roi >= settings.trailing_sl_activate_roi):
+                    try:
+                        cb  = _hc_for(state, sym).get("trail") or settings.trailing_sl_callback_pct
+                        if side == "LONG":
+                            trail_sl = mark * (1 - cb)
+                            # v15: pivot trailing (LONG)
+                            _pv = pivot_trail_sl("LONG", highs_p, lows_p, atr_pos) if closes_pos else None
+                            if _pv is not None and mark * 0.90 < _pv < mark:
+                                trail_sl = _pv
+                            # Geser SL ke atas jika lebih menguntungkan
+                            cur_sl_orders = client.open_algo_orders(sym)
+                            cur_sl_price  = 0.0
+                            for o in cur_sl_orders:
+                                if "STOP" in str(o.get("type","")).upper() and "TAKE" not in str(o.get("type","")).upper():
+                                    cur_sl_price = float(o.get("stopPrice") or o.get("price") or 0)
+                            if trail_sl > cur_sl_price and cur_sl_price > 0:
+                                client.cancel_stop_loss_orders(sym)
+                                client.stop_loss_order(sym, side, trail_sl, abs(amt))
+                                event(f"Trailing SL {sym} ↑ {client.round_price(sym, trail_sl)} (ROI {roi:+.2f}%)")
+                        elif side == "SHORT":
+                            trail_sl = mark * (1 + cb)
+                            # v15: pivot trailing (SHORT)
+                            _pv = pivot_trail_sl("SHORT", highs_p, lows_p, atr_pos) if closes_pos else None
+                            if _pv is not None and mark < _pv < mark * 1.10:
+                                trail_sl = _pv
+                            cur_sl_orders = client.open_algo_orders(sym)
+                            cur_sl_price  = float('inf')
+                            for o in cur_sl_orders:
+                                if "STOP" in str(o.get("type","")).upper() and "TAKE" not in str(o.get("type","")).upper():
+                                    cur_sl_price = float(o.get("stopPrice") or o.get("price") or float('inf'))
+                            if trail_sl < cur_sl_price and cur_sl_price < float('inf'):
+                                client.cancel_stop_loss_orders(sym)
+                                client.stop_loss_order(sym, side, trail_sl, abs(amt))
+                                event(f"Trailing SL {sym} \u2193 {client.round_price(sym, trail_sl)} (ROI {roi:+.2f}%)")
+                    except Exception as e:
+                        event(f"Trailing SL {sym} error: {e}", "warning")
+
+                # --- Partial Close (cicil profit 50%) ---
+                pc_done = bool(state.get("partial_done", {}).get(sym))
+                _hc = _hc_for(state, sym)
+                _pc_enable = bool(_hc.get("partial_enable", settings.partial_close_enable))
+                _pc_ratio  = float(_hc.get("partial_ratio", settings.partial_close_ratio))
+                if (_pc_enable and not pc_done
+                        and roi >= settings.partial_close_roi and up > 0):
+                    try:
+                        close_qty = round(abs(amt) * _pc_ratio, 8)
+                        if close_qty > 0:
+                            client.close_position_market(sym, side, close_qty)
+                            state.setdefault("partial_done", {})[sym] = True
+                            save_state(state)
+                            event(f"Partial Close {sym}: closed {_pc_ratio*100:.0f}% @ ROI {roi:+.2f}%")
+                            tg.alert(f"\U0001f4b8 Partial Close {sym} {side} +{roi*100:.2f}% — {100-_pc_ratio*100:.0f}% left running")
+                    except Exception as e:
+                        event(f"Partial Close {sym} error: {e}", "warning")
+
+                positions_view.append({"symbol": sym, "side": side, "qty": abs(amt),
+                                        "entry": entry, "mark": mark, "upnl": up,
+                                        "profit_pct": pp, "roi": roi, "breakeven_done": be_done})
+
+            if closed_any:
+                refresh_dashboard(free, daily, positions_view)
+                time.sleep(settings.loop_seconds); continue
+
+            # Snapshot posisi yang dipegang (utk deteksi penutupan di loop berikutnya)
+            state["held_syms"] = {
+                pv["symbol"]: {
+                    "side": pv["side"],
+                    "ts":   state.get("entry_time", {}).get(pv["symbol"], time.time()),
+                    "margin": (pv["entry"] * pv["qty"] / max(1, settings.leverage))
+                              if pv.get("entry") and pv.get("qty") else 0.0,
+                }
+                for pv in positions_view
+            }
+
+            held_symbols = {p.get("symbol") for p in open_pos}
+            # Fix Bug3+4: Bersihkan semua state pair yang sudah tidak dipegang
+            changed = False
+            for _key in ("breakeven_done", "partial_done", "entry_time", "hc_meta"):
+                _old = state.get(_key) or {}
+                _new = {s: v for s, v in _old.items() if s in held_symbols}
+                if _new != _old:
+                    state[_key] = _new; changed = True
+            if changed: save_state(state)
+
+            if len(open_pos) >= settings.max_open_positions:
+                refresh_dashboard(free, daily, positions_view)
+                time.sleep(settings.loop_seconds); continue
+
+            # Session Filter — hanya entry saat jam aktif
+            _sess_ok, _sess_name = is_trading_session(settings.session_filter_enable)
+            if not _sess_ok:
+                screen_rows.clear()
+                screen_rows.append({"symbol": "ALL", "long": "-", "short": "-",
+                                    "side": "NONE", "status": f"\U0001f634 {_sess_name}"})
+                refresh_dashboard(free, daily, positions_view)
+                time.sleep(settings.loop_seconds); continue
+
+            # Cooldown global & batas harian
+            now = time.time()
+            if GLOBAL_CD_ENABLE and now - state.get("last_trade_ts", 0) < eff_cd_trade:
+                wait = int(eff_cd_trade - (now - state["last_trade_ts"]))
+                event(f"Cooldown global {wait}s")
+                refresh_dashboard(free, daily, positions_view)
+                time.sleep(settings.loop_seconds); continue
+            if GLOBAL_CD_ENABLE and now - state.get("last_loss_ts", 0) < eff_cd_loss:
+                wait = int(eff_cd_loss - (now - state["last_loss_ts"]))
+                event(f"Cooldown after-loss {wait}s")
+                refresh_dashboard(free, daily, positions_view)
+                time.sleep(settings.loop_seconds); continue
+            if state.get("daily_trades", 0) >= settings.max_daily_trades:
+                event("Daily trade limit reached")
+                refresh_dashboard(free, daily, positions_view)
+                time.sleep(settings.loop_seconds); continue
+
+            # -------- Screening ML (ganti rule-based) --------
+            screen_rows.clear()
+            _tf15_cache: dict = {}
+            best = None
+            borderline = None  # v10.1 (H): kandidat near-miss utk AI-confirm
+            _pair_cd = state.setdefault("last_trade_per_pair", {})
+            for sym in settings.symbols:
+                if sym in held_symbols:
+                    screen_rows.append({"symbol": sym, "long": "-", "short": "-",
+                                        "side": "NONE", "status": "position active"})
+                    continue
+                # Per-pair cooldown — cegah double entry pair yang sama
+                # v15: per-symbol cooldown (loss lama, win sebentar)
+                _ll = state.setdefault("last_loss_per_pair", {}).get(sym, 0)
+                _lt = max(_pair_cd.get(sym, 0), state.setdefault("last_close_per_pair", {}).get(sym, 0))
+                _cd_active = False
+                _cd_wait = 0
+                if PAIR_CD_ENABLE and now - _ll < PAIR_CD_LOSS:
+                    _cd_active = True; _cd_wait = int(PAIR_CD_LOSS - (now - _ll))
+                elif PAIR_CD_ENABLE and now - _lt < max(PAIR_CD_WIN, settings.min_reentry_seconds):
+                    _cd_active = True; _cd_wait = int(max(PAIR_CD_WIN, settings.min_reentry_seconds) - (now - _lt))
+                try:
+                    kl  = client.klines(sym, tf0, settings.klines_limit)
+                    # v14: TradFi guard — skip XAU/XAG kalau pasar emas/perak lagi tutup (weekend/jeda).
+                    if (settings.tradfi_guard_enable and is_tradfi_symbol(sym, settings)
+                            and not tradfi_market_open()):
+                        continue
+                    # Refresh sentiment tiap jam
+                    if time.time() - _sent_ts > 3600:
+                        _sentiment = get_fear_greed()
+                        _sent_ts   = time.time()
+                        log.info(log_sentiment(_sentiment))
+
+                    # Hybrid: ML dulu, rule-based fallback kalau HOLD/model belum ada
+                    if ml_ready:
+                        signal, conf = ml_engine.predict_signal(kl, sym, pair_label=sym)
+                        if signal == "HOLD":
+                            rb_sig, rb_conf = rule_signal(kl, sym)
+                            if rb_sig != "HOLD":
+                                signal, conf = rb_sig, rb_conf * 0.9
+                    else:
+                        signal, conf = rule_signal(kl, sym)
+
+                    # ── v10.1 (B): Fast-Scan Breakout — tangkap momentum yg kelewat ──
+                    bo_dir, bo_str = ("HOLD", 0.0)
+                    if settings.fast_scan_enable:
+                        bo_dir, bo_str = breakout_signal(kl, settings.breakout_lookback,
+                                                         settings.breakout_vol_mult)
+                        if signal == "HOLD" and bo_dir != "HOLD":
+                            signal = bo_dir
+                            conf   = max(conf, settings.breakout_conf)
+
+                    # ── v10: CONFLUENCE SCORING (Opsi A) ──
+                    # Tiap filter memberi poin (+/-), bukan veto mati.
+                    # Entry kalau total skor >= settings.confluence_min_score.
+                    # v15: Mode Selector AND-gate
+                    if signal != "HOLD":
+                        _tradfi_scout = False
+                        _m_ok, _m_res = gate_ok(signal, kl)
+                        if not _m_ok:
+                            # RODI-V2.3B-MODE-SOFT-OVERRIDE
+                            # Soft override mode gate for BOT KERJA RODI.
+                            # Normal mode gate remains active unless extra scan candidate is strong enough.
+                            try:
+                                import os as _rodi_os_mode
+                                _rodi_mode_on = str(_rodi_os_mode.getenv('EXTRA_SCAN_ALL_PAIRS', 'false')).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+                                _rodi_mode_min = float(_rodi_os_mode.getenv('EXTRA_SCAN_MIN_SOFT_CONF', '0.44'))
+                                _rodi_mode_override = (
+                                    _rodi_mode_on
+                                    and signal != 'HOLD'
+                                    and float(conf) >= _rodi_mode_min
+                                    and str(getattr(_m_res, 'mode', '')).upper() in ('TREND', 'NO_TRADE', 'SIDEWAYS')
+                                )
+                            except Exception:
+                                _rodi_mode_override = False
+                            if _rodi_mode_override:
+                                event(f"RODI-MODE override {sym} {signal} mode {getattr(_m_res, 'mode', '?')} conf={float(conf):.2f}")
+                            else:
+                                event(f"{sym}: mode {_m_res.mode} tolak {signal}")
+                                continue
+                    conf_score = 0.0
+                    sc_parts = []
+                    _hunt_extra_min = 0.0
+                    _smart_extra_min = 0.0
+                    _nh = locals().get("_news_hunt", {"mode":"normal","risk":"neutral","hot_pairs":[],"signals":[]})
+                    if signal != "HOLD":
+                        base = round((conf - 0.5) * 10.0, 1)   # ML: 0.50->0, 0.70->+2, 0.85->+3.5
+                        conf_score += base
+                        sc_parts.append(f"ML{base:+.1f}")
+                        
+                        # TRADFI-SCOUT: XAU/XAG diberi kesempatan saat mode selector terlalu kaku.
+                        # Tetap bukan auto-entry: AI/FASTSCAN/HARD-15M/guard lain masih wajib lolos.
+                        if locals().get("_tradfi_scout", False):
+                            _ts_bonus = _tradfi_scout_env_float("TRADFI_SCOUT_SCORE_BONUS", 0.4)
+                            _ts_req = _tradfi_scout_env_float("TRADFI_SCOUT_REQ_EXTRA", 0.1)
+                            conf_score += _ts_bonus
+                            _hunt_extra_min = locals().get("_hunt_extra_min", 0.0) + _ts_req
+                            sc_parts.append(f"TRADFISCOUT+{_ts_bonus:.1f}")
+                            sc_parts.append(f"TRADFIreq+{_ts_req:.1f}")
+                        # HIGH-CONF FAST LANE:
+                        # Conf tinggi jangan diperlakukan sama seperti threshold minimal.
+                        try:
+                            if float(conf) >= 0.75:
+                                conf_score += 0.8
+                                sc_parts.append("HIGHCONF+0.8")
+                            elif float(conf) >= 0.65:
+                                conf_score += 0.4
+                                sc_parts.append("STRONGCONF+0.4")
+                        except Exception:
+                            pass
+
+
+                        # PROFIT BRAIN v2 structured memory
+                        try:
+                            _lesson=_profit_brain_get_lesson(sym,signal)
+                            if _lesson:
+                                _pb_pen=float(_lesson.get("penalty",0) or 0)
+                                _pb_req=float(_lesson.get("extra_req",0) or 0)
+                                _pb_reason=str(_lesson.get("reason","loss_memory"))[:32]
+                                if _pb_pen:
+                                    conf_score-=_pb_pen
+                                    sc_parts.append(f"PB-{_pb_pen:.1f}")
+                                if _pb_req:
+                                    _smart_extra_min+=_pb_req
+                                    sc_parts.append(f"PBreq+{_pb_req:.1f}")
+                                sc_parts.append(f"PB:{_pb_reason}")
+                        except Exception:
+                            pass
+
+                        # LEARNING MEMORY:
+                        # Kalau pair+side baru loss, jangan ulang pola sama tanpa extra kualitas.
+                        try:
+                            _loss_mem, _loss_why = _recent_loss_same_side(sym, signal)
+                            if _loss_mem:
+                                conf_score -= 0.3
+                                _smart_extra_min += 0.2
+                                sc_parts.append("LEARN-0.3")
+                                sc_parts.append("LEARNreq+0.2")
+                        except Exception:
+                            pass
+
+
+                        # Breakout bonus (B) — sinyal searah breakout momentum
+                        if settings.fast_scan_enable and bo_dir == signal and bo_dir != "HOLD":
+                            conf_score += settings.w_breakout
+                            sc_parts.append(f"BO{settings.w_breakout:+.1f}")
+
+                        # Sentiment (Fear & Greed)
+                        sf = _sentiment.get("signal_filter", "ok")
+                        if (sf == "skip_long" and signal == "LONG") or (sf == "skip_short" and signal == "SHORT"):
+                            conf_score += settings.w_sentiment_against
+                            sc_parts.append(f"Sent{settings.w_sentiment_against:+.1f}")
+
+                        # News-bias legacy, default OFF kalau NEWS_BIAS_ENABLE=false
+                        if _news_bias in ("long", "short"):
+                            if _news_bias == signal.lower():
+                                conf_score += settings.w_news_align
+                                sc_parts.append(f"News{settings.w_news_align:+.1f}")
+                            else:
+                                conf_score += settings.w_news_against
+                                sc_parts.append(f"News{settings.w_news_against:+.1f}")
+
+                        # NEWS-HUNT: radar peluang, bukan bias global
+                        try:
+                            _hot = _news_hunt_for_symbol(_nh, sym)
+                            _scout = _news_hunt_signal_for_symbol(_nh, sym)
+                            if _hot:
+                                _risk = str(_hot.get("risk", _nh.get("risk","neutral"))).lower()
+                                if _risk == "high":
+                                    _hunt_extra_min += 0.2
+                                    sc_parts.append("HUNTreq+0.2")
+                                elif _risk == "medium":
+                                    _hunt_extra_min += 0.1
+                                    sc_parts.append("HUNTreq+0.1")
+                                else:
+                                    sc_parts.append("HUNT")
+                            if _scout:
+                                _sside = str(_scout.get("side","")).upper().strip()
+                                _sconf = float(_scout.get("confidence",0) or 0)
+                                if _sside == signal:
+                                    _bonus = 0.8 if _sconf >= 0.70 else 0.5
+                                    conf_score += _bonus
+                                    sc_parts.append(f"Scout{_bonus:+.1f}")
+                                elif _sside in ("LONG","SHORT"):
+                                    _pen = -0.8 if _sconf >= 0.70 else -0.5
+                                    conf_score += _pen
+                                    sc_parts.append(f"Scout{_pen:+.1f}")
+                        except Exception:
+                            pass
+
+                        # MTF (trend timeframe lebih besar)
+                        if settings.mtf_enable:
+                            htf_trend = get_htf_trend(client, sym, tf0)
+                            if mtf_confirms(htf_trend, signal):
+                                conf_score += settings.w_mtf_align
+                                sc_parts.append(f"MTF{settings.w_mtf_align:+.1f}")
+                            else:
+                                conf_score += settings.w_mtf_against
+                                sc_parts.append(f"MTF{settings.w_mtf_against:+.1f}")
+
+                        # v12 (5): Screening 15m (konfirmasi tren TF lebih tinggi) + cache utk High-Conviction
+                        if settings.screen_15m_enable:
+                            try:
+                                kl15 = client.klines(sym, settings.screen_15m_tf, settings.klines_limit)
+                                if ml_ready:
+                                    s15, c15 = ml_engine.predict_signal(kl15, sym, pair_label=sym)
+                                    if s15 == "HOLD":
+                                        s15, c15 = rule_signal(kl15, sym)
+                                else:
+                                    s15, c15 = rule_signal(kl15, sym)
+                                _tf15_cache[sym] = (s15, c15)
+                                if s15 != "HOLD":
+                                    if s15 == signal:
+                                        conf_score += settings.w_screen_15m_align
+                                        sc_parts.append(f"15m{settings.w_screen_15m_align:+.1f}")
+                                    else:
+                                        conf_score += settings.w_screen_15m_against
+                                        sc_parts.append(f"15m{settings.w_screen_15m_against:+.1f}")
+                            except Exception:
+                                pass
+
+                        # Order Book (tekanan beli/jual)
+                        if settings.orderbook_filter_enable:
+                            ob = get_imbalance(sym)
+                            if orderbook_confirms(ob, signal):
+                                conf_score += settings.w_ob_align
+                                sc_parts.append(f"OB{settings.w_ob_align:+.1f}")
+                            else:
+                                conf_score += settings.w_ob_against
+                                sc_parts.append(f"OB{settings.w_ob_against:+.1f}")
+
+                        # v11 (1): Order-Flow Anomaly (cumulative delta + imbalance + spoof)
+                        if settings.orderflow_enable:
+                            of = analyze_orderflow(client, sym, kl, settings.of_lookback, settings.of_wall_ratio)
+                            if of["bias"] != "NEUTRAL":
+                                if of["bias"] == signal:
+                                    conf_score += settings.w_orderflow_align
+                                    sc_parts.append(f"OF{settings.w_orderflow_align:+.1f}")
+                                else:
+                                    conf_score += settings.w_orderflow_against
+                                    sc_parts.append(f"OF{settings.w_orderflow_against:+.1f}")
+                            if of["spoof"]:
+                                conf_score += settings.of_spoof_penalty
+                                sc_parts.append(f"SPOOF{settings.of_spoof_penalty:+.1f}")
+                                event(f"⚠️ {of['warning']}", "warning")
+
+                        # v11 (3): Squeeze / Volatility predictor -> dukung breakout
+                        if settings.squeeze_enable:
+                            sq = squeeze_signal(client, sym, kl,
+                                                settings.squeeze_funding_extreme,
+                                                settings.squeeze_oi_rise_pct)
+                            if sq["squeeze"] and sq["direction"] == signal:
+                                conf_score += settings.w_squeeze_align
+                                sc_parts.append(f"SQZ{settings.w_squeeze_align:+.1f}")
+                                event(f"🌪️ {sq['note']}")
+
+                        # v11 (2): Positioning bias (Binance GRATIS: retail vs top-trader L/S)
+                        if settings.positioning_enable:
+                            ps = positioning_signal(client, sym, settings.ls_crowd_extreme)
+                            if ps["bias"] in ("LONG", "SHORT"):
+                                if ps["bias"] == signal:
+                                    conf_score += settings.w_positioning_align
+                                    sc_parts.append(f"POS{settings.w_positioning_align:+.1f}")
+                                    if ps["note"]:
+                                        event(f"📡 {ps['note']}")
+                                else:
+                                    conf_score += settings.w_positioning_against
+                                    sc_parts.append(f"POS{settings.w_positioning_against:+.1f}")
+                    conf_score = round(conf_score, 1)
+                    # RODI-V2-SAFE-RANK-HOOK
+                    try:
+                        import os as _rodi_os
+                        if str(_rodi_os.getenv("EXTRA_SCAN_ALL_PAIRS", "false")).strip().lower() in ("1", "true", "yes", "y", "on"):
+                            _rodi_sig = str(signal).upper()
+                            if _rodi_sig in ("LONG", "SHORT"):
+                                _rodi_bonus = float(_rodi_os.getenv("EXTRA_SCAN_SCORE_BONUS", "0.20"))
+                                _rodi_req = float(_rodi_os.getenv("EXTRA_SCAN_REQ_EXTRA", "0.05"))
+                                conf_score = round(float(conf_score) + _rodi_bonus, 1)
+                                _hunt_extra_min = locals().get("_hunt_extra_min", 0.0) + _rodi_req
+                                try:
+                                    sc_parts.append(f"RODI+{_rodi_bonus:.2f}")
+                                    sc_parts.append(f"RODIreq+{_rodi_req:.2f}")
+                                except Exception:
+                                    pass
+                                try:
+                                    event(f"EXTRA-SCAN candidate {sym} {signal} conf={float(conf):.2f} score={float(conf_score):+.1f}")
+                                except Exception:
+                                    pass
+                    except Exception as _rodi_e:
+                        try:
+                            event(f"EXTRA-SCAN hook err {sym}: {_rodi_e}", "warning")
+                        except Exception:
+                            pass
+                except Exception as e:
+                    screen_rows.append({"symbol": sym, "long": "-", "short": "-",
+                                        "side": "NONE", "status": f"err: {e}"})
+                    event(f"ML screen {sym} error: {e}", "warning")
+                    continue
+
+                prob_str = f"{conf*100:.0f}%"
+                sc_str   = " ".join(sc_parts) if sc_parts else "-"
+                # RODI-V2.2C-PROMOTE-PASSED
+                try:
+                    import os as _rodi_os2
+                    _rodi_promote = (
+                        str(_rodi_os2.getenv("EXTRA_SCAN_ALL_PAIRS", "false")).strip().lower() in ("1", "true", "yes", "y", "on")
+                        and signal != "HOLD"
+                        and float(conf) >= float(_rodi_os2.getenv("EXTRA_SCAN_MIN_SOFT_CONF", "0.44"))
+                        and float(conf_score) >= float(locals().get("_eff_conf_min", eff_conf_min))
+                    )
+                except Exception:
+                    _rodi_promote = False
+                passed = (
+                    signal != "HOLD"
+                    and (
+                        float(conf) >= float(settings.ml_proba_threshold)
+                        or _rodi_promote
+                    )
+                    and conf_score >= locals().get("_eff_conf_min", eff_conf_min)
+                )
+                if signal == "HOLD":
+                    status = f"HOLD ({prob_str})"
+                elif passed:
+                    status = f"{signal} {prob_str} | skor {conf_score:+.1f} ✓ [{sc_str}]"
+                else:
+                    status = f"HOLD | skor {conf_score:+.1f} < {eff_conf_min:+.1f} [{sc_str}]"
+                screen_rows.append({"symbol": sym, "long": prob_str if signal == "LONG" else "-",
+                                    "short": prob_str if signal == "SHORT" else "-",
+                                    "side": signal if passed else "NONE",
+                                    "status": status, "score": conf_score})
+                # Pilih kandidat terbaik berdasarkan SKOR confluence tertinggi
+                if passed and (best is None or conf_score > best[3]):
+                    best = (sym, signal, conf, conf_score)
+                # v10.1 (H): simpan near-miss (lolos ML, skor mepet di bawah threshold)
+                elif (signal != "HOLD" and conf >= settings.ml_proba_threshold
+                      and conf_score < locals().get("_eff_conf_min", eff_conf_min)
+                      and conf_score >= locals().get("_eff_conf_min", eff_conf_min) - settings.borderline_margin):
+                    if borderline is None or conf_score > borderline[3]:
+                        borderline = (sym, signal, conf, conf_score, list(sc_parts))
+                refresh_dashboard(free, daily, positions_view)
+
+            # v10.1 (H): tak ada yg lolos tapi ada near-miss -> minta AI confirm SEKALI
+            if best is None and borderline is not None and settings.ai_confirm_enable:
+                _bs, _bsig, _bconf, _bscore, _bparts = borderline
+                try:
+                    from .ai_confirm import confirm_entry
+                    _ok, _why = confirm_entry(_bs, _bsig, _bconf, _bscore, _bparts,
+                                              _sentiment, _news_bias)
+                    if _ok:
+                        best = (_bs, _bsig, _bconf, _bscore)
+                        event(f"AI-CONFIRM ✓ {_bsig} {_bs} score {_bscore:+.1f} (near-miss rescued): {_why}")
+                    else:
+                        event(f"AI-CONFIRM ✗ {_bsig} {_bs} score {_bscore:+.1f}: {_why}")
+                except Exception as e:
+                    event(f"AI-confirm error: {e}", "warning")
+
+            if best is None:
+                event("No ML signal passed the threshold")
+                refresh_dashboard(free, daily, positions_view)
+                time.sleep(settings.loop_seconds); continue
+
+            sym, sig_side, conf, conf_score = best
+
+            # v12 (7): High-Conviction Mode — sinyal buagus -> perpanjang TP & aktifkan partial.
+            hc_meta = {}
+            if settings.high_conviction_enable:
+                s15, c15 = _tf15_cache.get(sym, ("HOLD", 0.0))
+                if s15 == sig_side and c15 >= settings.hc_conf1:
+                    hc_meta = {"tier": 1, "tp_mult": settings.hc_tp_mult1,
+                               "trail": settings.hc_trail1,
+                               "partial_ratio": settings.hc_partial1, "partial_enable": True}
+                    event(f"\U0001f525 HIGH-CONVICTION T1 {sig_side} {sym}: 15m conf {c15*100:.0f}% -> TP x{settings.hc_tp_mult1}, partial {settings.hc_partial1*100:.0f}%")
+                elif conf >= settings.hc_conf2:
+                    hc_meta = {"tier": 2, "tp_mult": settings.hc_tp_mult2,
+                               "trail": settings.hc_trail2,
+                               "partial_ratio": settings.hc_partial2, "partial_enable": True}
+                    event(f"\U0001f525 HIGH-CONVICTION T2 {sig_side} {sym}: 5m conf {conf*100:.0f}% -> TP x{settings.hc_tp_mult2}, partial {settings.hc_partial2*100:.0f}%")
+            if hc_meta:
+                state.setdefault("hc_meta", {})[sym] = hc_meta
+                save_state(state)
+
+            # -------- Gerbang pra-entry --------
+            # 1. Jam: hindari 5 menit pertama candle 1H
+            if datetime.now(timezone.utc).minute < settings.avoid_first_minutes_of_hour:
+                event(f"Skip {sym}: first {settings.avoid_first_minutes_of_hour} minutes of the 1H candle")
+                refresh_dashboard(free, daily, positions_view); time.sleep(settings.loop_seconds); continue
+
+            # 2. Funding rate
+            try:
+                fr = client.funding_rate(sym)
+                if abs(fr) > settings.funding_rate_max:
+                    event(f"Skip {sym}: funding {fr*100:.3f}% > batas")
+                    refresh_dashboard(free, daily, positions_view); time.sleep(settings.loop_seconds); continue
+            except Exception:
+                pass
+
+            # 3. Spread
+            prof = profile_for(sym)
+            if settings.spread_filter_enable:
+                try:
+                    sp = client.spread_pct(sym)
+                    if sp > prof.max_spread_pct:
+                        event(f"Skip {sym}: spread {sp*100:.3f}% > {prof.max_spread_pct*100:.2f}%")
+                        refresh_dashboard(free, daily, positions_view); time.sleep(settings.loop_seconds); continue
+                except Exception:
+                    pass
+
+            # v14: AI VETO GATE — konfirmasi akhir kandidat TERBAIK sebelum entry.
+            # ML = generator sinyal; AI = overseer yang HANYA bisa meloloskan/veto (bukan bikin sinyal).
+            # FAIL-OPEN: AI error/timeout/tanpa-key -> lanjut entry, kecuali AI_VETO_STRICT=true.
+            if settings.ai_veto_enable:
+                try:
+                    from .ai_confirm import veto_entry
+                    _vok, _vgrade, _vwhy = veto_entry(sym, sig_side, conf, conf_score,
+                                                      _sentiment, _news_bias, _regime,
+                                                      strict=settings.ai_veto_strict)
+                except Exception as _ve:
+                    _vok, _vgrade, _vwhy = (not settings.ai_veto_strict), "?", f"err:{_ve}"
+                state.setdefault("last_veto", {})[sym] = {
+                    "ok": _vok, "grade": _vgrade, "why": _vwhy}
+                save_state(state)
+                if not _vok:
+                    event(f"\U0001f6ab AI VETO {sig_side} {sym} [grade {_vgrade}]: {_vwhy}")
+                    refresh_dashboard(free, daily, positions_view)
+                    time.sleep(settings.loop_seconds); continue
+                event(f"\u2705 AI OK {sig_side} {sym} [grade {_vgrade}]: {_vwhy}")
+
+            # -------- Hitung qty (v10.1 E: Dynamic sizing by conviction) --------
+            size_mult = 1.0
+            if settings.dynamic_size_enable:
+                size_mult = 1.0 + (conf_score - eff_conf_min) * settings.dynamic_size_per_point
+                size_mult = max(settings.dynamic_size_min_mult,
+                                min(settings.dynamic_size_max_mult, size_mult))
+                if abs(size_mult - 1.0) > 0.01:
+                    event(f"Dynamic size {sym}: x{size_mult:.2f} (score {conf_score:+.1f})")
+            plan = calc_entry_from_free_margin(sym, sig_side, free, settings, size_mult)
+            qty, price, rules = client.calc_qty(sym, plan.notional)
+            if qty <= 0:
+                event(f"{sym}: qty too small", "warning")
+                time.sleep(settings.loop_seconds); continue
+            if qty * price / max(1, settings.leverage) > free:
+                event(f"{sym}: not enough margin (need ~{qty*price/settings.leverage:.2f} USDT)", "warning")
+                time.sleep(settings.loop_seconds); continue
+
+
+            # -------- Overextended Bounce/Rejection Guard --------
+            # Blok LONG kalau harga sudah bounce jauh dari swing low + oscillator overbought.
+            # Blok SHORT kalau harga sudah dump jauh dari swing high + oscillator oversold.
+            try:
+                import pandas as _pd
+                from .features import create_scalping_features as _acf
+
+                def _df_from_kl(_kl):
+                    _cols12 = [
+                        "timestamp", "open", "high", "low", "close", "volume",
+                        "close_time", "quote_vol", "trades", "taker_buy_base",
+                        "taker_buy_quote", "ignore"
+                    ]
+                    if len(_kl[0]) >= 12:
+                        _df = _pd.DataFrame(_kl, columns=_cols12)
+                    else:
+                        _df = _pd.DataFrame(_kl, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                    _df = _df[["timestamp", "open", "high", "low", "close", "volume"]].copy()
+                    for _col in ["open", "high", "low", "close", "volume"]:
+                        _df[_col] = _pd.to_numeric(_df[_col], errors="coerce")
+                    return _df.dropna()
+
+                def _val(_row, _names, _default=50.0):
+                    for _n in _names:
+                        if _n in _row:
+                            try:
+                                return float(_row[_n])
+                            except Exception:
+                                pass
+                    return _default
+
+                def _over_state(_tf, _kl_src=None):
+                    try:
+                        _klx = _kl_src if _kl_src is not None else client.klines(sym, _tf, settings.klines_limit)
+                        _df = _df_from_kl(_klx)
+                        if len(_df) < 30:
+                            return "neutral"
+
+                        _feat = _acf(_df).dropna()
+                        if len(_feat) < 5:
+                            return "neutral"
+
+                        _a = _feat.iloc[-1]
+                        _b = _feat.iloc[-2]
+
+                        _close = float(_df["close"].iloc[-1])
+                        _close1 = float(_df["close"].iloc[-2])
+                        _high = float(_df["high"].iloc[-1])
+                        _low = float(_df["low"].iloc[-1])
+
+                        _recent_low = float(_df["low"].tail(12).min())
+                        _recent_high = float(_df["high"].tail(12).max())
+
+                        _bounce_pct = (_close - _recent_low) / max(_recent_low, 1e-9)
+                        _drop_pct = (_recent_high - _close) / max(_recent_high, 1e-9)
+
+                        _rsi = _val(_a, ["rsi", "rsi_6", "rsi6", "RSI", "RSI6"], 50.0)
+                        _rsi1 = _val(_b, ["rsi", "rsi_6", "rsi6", "RSI", "RSI6"], 50.0)
+
+                        _st = _val(_a, ["stochrsi", "stoch_rsi", "stochrsi_k", "stoch_k", "STOCHRSI"], 50.0)
+                        _st1 = _val(_b, ["stochrsi", "stoch_rsi", "stochrsi_k", "stoch_k", "STOCHRSI"], 50.0)
+
+                        _macd = _val(_a, ["macd_hist", "hist", "macd", "MACD"], 0.0)
+                        _macd1 = _val(_b, ["macd_hist", "hist", "macd", "MACD"], 0.0)
+
+                        _stall_up = (_close <= _close1) or (_high <= float(_df["high"].iloc[-2]))
+                        _stall_dn = (_close >= _close1) or (_low >= float(_df["low"].iloc[-2]))
+
+                        # LINK contoh:
+                        # 3m/5m RSI 80+, Stoch 95-100, bounce > ~0.8-1.2% dari low -> jangan LONG.
+                        _long_overextended = (
+                            (_bounce_pct >= 0.008 and _rsi >= 70 and _st >= 80)
+                            or (_bounce_pct >= 0.006 and _rsi >= 75)
+                            or (_rsi >= 80 and _st >= 90)
+                        )
+
+                        # Tambahan kalau mulai stall/reject di atas.
+                        if _long_overextended and (_stall_up or _macd < _macd1 or _st <= _st1):
+                            return "long_overextended"
+
+                        # SHORT kebalikannya:
+                        # sudah dump jauh dari recent high + oscillator oversold -> jangan SHORT.
+                        _short_overextended = (
+                            (_drop_pct >= 0.008 and _rsi <= 30 and _st <= 20)
+                            or (_drop_pct >= 0.006 and _rsi <= 25)
+                            or (_rsi <= 20 and _st <= 10)
+                        )
+
+                        if _short_overextended and (_stall_dn or _macd > _macd1 or _st >= _st1):
+                            return "short_overextended"
+
+                        return "neutral"
+                    except Exception:
+                        return "neutral"
+
+                _o5 = _over_state(tf0, kl)
+                _o3 = _over_state("3m")
+                _o15 = _over_state("15m")
+
+                _long_ext_votes = sum(1 for _x in [_o3, _o5, _o15] if _x == "long_overextended")
+                _short_ext_votes = sum(1 for _x in [_o3, _o5, _o15] if _x == "short_overextended")
+
+                if sig_side == "LONG" and _long_ext_votes >= 2:
+                    event(
+                        f"{sym}: OVEREXTENDED block LONG "
+                        f"(3m={_o3}, 5m={_o5}, 15m={_o15})"
+                    )
+                    refresh_dashboard(free, daily, positions_view)
+                    time.sleep(1)
+                    continue
+
+                if sig_side == "SHORT" and _short_ext_votes >= 2:
+                    event(
+                        f"{sym}: OVEREXTENDED block SHORT "
+                        f"(3m={_o3}, 5m={_o5}, 15m={_o15})"
+                    )
+                    refresh_dashboard(free, daily, positions_view)
+                    time.sleep(1)
+                    continue
+
+            except Exception as _oex:
+                event(f"OVEREXTENDED guard error {sym}: {_oex}", "warning")
+
+
+            # -------- MTF Anti-Chase Reversal Guard (3m/5m/15m) --------
+            # Blok SHORT kalau multi-timeframe pendek sedang bounce naik dari bottom.
+            # Blok LONG kalau multi-timeframe pendek sedang reject turun dari top.
+            try:
+                import pandas as _pd
+                from .features import create_scalping_features as _acf
+
+                def _mtf_kl_to_df(_kl):
+                    _cols12 = [
+                        "timestamp", "open", "high", "low", "close", "volume",
+                        "close_time", "quote_vol", "trades", "taker_buy_base",
+                        "taker_buy_quote", "ignore"
+                    ]
+                    if not _kl:
+                        return None
+                    if len(_kl[0]) >= 12:
+                        _df = _pd.DataFrame(_kl, columns=_cols12)
+                    else:
+                        _df = _pd.DataFrame(_kl, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                    _df = _df[["timestamp", "open", "high", "low", "close", "volume"]].copy()
+                    for _c in ["open", "high", "low", "close", "volume"]:
+                        _df[_c] = _pd.to_numeric(_df[_c], errors="coerce")
+                    return _df.dropna()
+
+                def _mtf_get(_row, _names, _default=0.0):
+                    for _n in _names:
+                        if _n in _row:
+                            try:
+                                return float(_row[_n])
+                            except Exception:
+                                pass
+                    return _default
+
+                def _mtf_state(_tf, _kl_src=None):
+                    # return: "bounce_up", "reject_down", atau "neutral"
+                    try:
+                        _klx = _kl_src if _kl_src is not None else client.klines(sym, _tf, settings.klines_limit)
+                        _df = _mtf_kl_to_df(_klx)
+                        if _df is None or len(_df) < 20:
+                            return "neutral"
+
+                        _feat = _acf(_df).dropna()
+                        if len(_feat) < 4:
+                            return "neutral"
+
+                        _a = _feat.iloc[-1]
+                        _b = _feat.iloc[-2]
+                        _c = _feat.iloc[-3]
+
+                        _rsi  = _mtf_get(_a, ["rsi", "rsi_6", "rsi6", "RSI", "RSI6"], 50.0)
+                        _rsi1 = _mtf_get(_b, ["rsi", "rsi_6", "rsi6", "RSI", "RSI6"], 50.0)
+
+                        _st   = _mtf_get(_a, ["stochrsi", "stoch_rsi", "stochrsi_k", "stoch_k", "STOCHRSI"], 50.0)
+                        _st1  = _mtf_get(_b, ["stochrsi", "stoch_rsi", "stochrsi_k", "stoch_k", "STOCHRSI"], 50.0)
+                        _st2  = _mtf_get(_c, ["stochrsi", "stoch_rsi", "stochrsi_k", "stoch_k", "STOCHRSI"], 50.0)
+
+                        _macd  = _mtf_get(_a, ["macd_hist", "hist", "macd", "MACD"], 0.0)
+                        _macd1 = _mtf_get(_b, ["macd_hist", "hist", "macd", "MACD"], 0.0)
+
+                        _close  = float(_df["close"].iloc[-1])
+                        _close1 = float(_df["close"].iloc[-2])
+                        _low1   = float(_df["low"].iloc[-2])
+                        _high1  = float(_df["high"].iloc[-2])
+
+                        _rsi_up = _rsi > _rsi1
+                        _rsi_dn = _rsi < _rsi1
+
+                        _st_up = (_st > _st1 and (_st1 <= _st2 or _st < 55))
+                        _st_dn = (_st < _st1 and (_st1 >= _st2 or _st > 45))
+
+                        _macd_up = _macd > _macd1
+                        _macd_dn = _macd < _macd1
+
+                        _green = _close > _close1
+                        _red   = _close < _close1
+
+                        _bounce_from_low = _green and _close > _low1
+                        _reject_from_high = _red and _close < _high1
+
+                        _bounce_up = (
+                            (_rsi <= 55 and _rsi_up and _st_up)
+                            or (_st <= 45 and _st_up and _macd_up)
+                            or (_rsi <= 50 and _macd_up and _bounce_from_low)
+                        )
+
+                        _reject_down = (
+                            (_rsi >= 45 and _rsi_dn and _st_dn)
+                            or (_st >= 55 and _st_dn and _macd_dn)
+                            or (_rsi >= 50 and _macd_dn and _reject_from_high)
+                        )
+
+                        if _bounce_up:
+                            return "bounce_up"
+                        if _reject_down:
+                            return "reject_down"
+                        return "neutral"
+                    except Exception:
+                        return "neutral"
+
+                _mtf_s5 = _mtf_state(tf0, kl)
+                _mtf_s3 = _mtf_state("3m")
+                _mtf_s15 = _mtf_state("15m")
+
+                _bounce_votes = sum(1 for _x in [_mtf_s3, _mtf_s5, _mtf_s15] if _x == "bounce_up")
+                _reject_votes = sum(1 for _x in [_mtf_s3, _mtf_s5, _mtf_s15] if _x == "reject_down")
+
+                if sig_side == "SHORT" and _bounce_votes >= 2:
+                    event(
+                        f"{sym}: MTF-ANTI-CHASE block SHORT "
+                        f"(3m={_mtf_s3}, 5m={_mtf_s5}, 15m={_mtf_s15})"
+                    )
+                    refresh_dashboard(free, daily, positions_view)
+                    time.sleep(1)
+                    continue
+
+                if sig_side == "LONG" and _reject_votes >= 2:
+                    event(
+                        f"{sym}: MTF-ANTI-CHASE block LONG "
+                        f"(3m={_mtf_s3}, 5m={_mtf_s5}, 15m={_mtf_s15})"
+                    )
+                    refresh_dashboard(free, daily, positions_view)
+                    time.sleep(1)
+                    continue
+
+            except Exception as _mtface:
+                event(f"MTF-ANTI-CHASE guard error {sym}: {_mtface}", "warning")
+
+
+            # -------- HARD 15m Direction Guard --------
+            # Kompas 15m: jangan SHORT saat 15m bounce/bullish, jangan LONG saat 15m reject/bearish.
+            try:
+                import pandas as _pd
+                from .features import create_scalping_features as _h15_feat
+
+                def _h15_df(_kl):
+                    _cols12 = [
+                        "timestamp", "open", "high", "low", "close", "volume",
+                        "close_time", "quote_vol", "trades", "taker_buy_base",
+                        "taker_buy_quote", "ignore"
+                    ]
+                    if not _kl:
+                        return None
+                    if len(_kl[0]) >= 12:
+                        _df = _pd.DataFrame(_kl, columns=_cols12)
+                    else:
+                        _df = _pd.DataFrame(_kl, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                    _df = _df[["timestamp", "open", "high", "low", "close", "volume"]].copy()
+                    for _c in ["open", "high", "low", "close", "volume"]:
+                        _df[_c] = _pd.to_numeric(_df[_c], errors="coerce")
+                    return _df.dropna()
+
+                def _h15_get(_row, _names, _default=0.0):
+                    for _n in _names:
+                        if _n in _row:
+                            try:
+                                return float(_row[_n])
+                            except Exception:
+                                pass
+                    return _default
+
+                _kl15 = client.klines(sym, "15m", settings.klines_limit)
+                _df15 = _h15_df(_kl15)
+
+                if _df15 is not None and len(_df15) >= 30:
+                    _feat15 = _h15_feat(_df15).dropna()
+
+                    if len(_feat15) >= 4:
+                        _a = _feat15.iloc[-1]
+                        _b = _feat15.iloc[-2]
+                        _c = _feat15.iloc[-3]
+
+                        _close = float(_df15["close"].iloc[-1])
+                        _close1 = float(_df15["close"].iloc[-2])
+                        _open = float(_df15["open"].iloc[-1])
+
+                        _ma7 = float(_df15["close"].rolling(7).mean().iloc[-1])
+                        _ma25 = float(_df15["close"].rolling(25).mean().iloc[-1])
+
+                        _rsi = _h15_get(_a, ["rsi", "rsi_6", "rsi6", "RSI", "RSI6"], 50.0)
+                        _rsi1 = _h15_get(_b, ["rsi", "rsi_6", "rsi6", "RSI", "RSI6"], 50.0)
+
+                        _st = _h15_get(_a, ["stochrsi", "stoch_rsi", "stochrsi_k", "stoch_k", "STOCHRSI"], 50.0)
+                        _st1 = _h15_get(_b, ["stochrsi", "stoch_rsi", "stochrsi_k", "stoch_k", "STOCHRSI"], 50.0)
+                        _st2 = _h15_get(_c, ["stochrsi", "stoch_rsi", "stochrsi_k", "stoch_k", "STOCHRSI"], 50.0)
+
+                        _macd = _h15_get(_a, ["macd_hist", "hist", "macd", "MACD"], 0.0)
+                        _macd1 = _h15_get(_b, ["macd_hist", "hist", "macd", "MACD"], 0.0)
+
+                        _rsi_up = _rsi > _rsi1
+                        _rsi_dn = _rsi < _rsi1
+                        _st_up = _st > _st1 and (_st1 <= _st2 or _st < 70)
+                        _st_dn = _st < _st1 and (_st1 >= _st2 or _st > 30)
+                        _macd_up = _macd > _macd1
+                        _macd_dn = _macd < _macd1
+
+                        _green = _close >= _open or _close > _close1
+                        _red = _close <= _open or _close < _close1
+
+                        # 15m bullish/bounce: SHORT dilarang.
+                        _h15_bull = (
+                            (_rsi >= 50 and _rsi_up)
+                            or (_rsi >= 55)
+                            or (_st <= 60 and _st_up and _macd_up)
+                            or (_close > _ma7 and _green)
+                            or (_close > _ma25 and _rsi >= 50)
+                        )
+
+                        # 15m bearish/reject: LONG dilarang.
+                        _h15_bear = (
+                            (_rsi <= 50 and _rsi_dn)
+                            or (_rsi <= 45)
+                            or (_st >= 40 and _st_dn and _macd_dn)
+                            or (_close < _ma7 and _red)
+                            or (_close < _ma25 and _rsi <= 50)
+                        )
+
+                        if sig_side == "SHORT" and _h15_bull:
+                            event(
+                                f"{sym}: HARD-15M block SHORT "
+                                f"(rsi={_rsi:.1f}, stoch={_st:.1f}, macdΔ={_macd-_macd1:.4f})"
+                            )
+                            refresh_dashboard(free, daily, positions_view)
+                            time.sleep(1)
+                            continue
+
+                        if sig_side == "LONG" and _h15_bear:
+                            event(
+                                f"{sym}: HARD-15M block LONG "
+                                f"(rsi={_rsi:.1f}, stoch={_st:.1f}, macdΔ={_macd-_macd1:.4f})"
+                            )
+                            refresh_dashboard(free, daily, positions_view)
+                            time.sleep(1)
+                            continue
+
+            except Exception as _h15e:
+                event(f"HARD-15M guard error {sym}: {_h15e}", "warning")
+
+
+            # -------- MTF FAST-SCAN FINAL CONFIRM (1m/3m/5m/15m) --------
+            # Final check sebelum entry:
+            # - Block SHORT kalau 1m/3m/5m/15m mulai bounce naik.
+            # - Block LONG kalau 1m/3m/5m/15m mulai reject turun.
+            # Tujuan: jangan short bottom / long top, tapi tetap fast-rescan cari arah valid.
+            try:
+                import pandas as _pd
+                from .features import create_scalping_features as _fs_feat
+
+                def _fs_df(_kl):
+                    _cols12 = [
+                        "timestamp", "open", "high", "low", "close", "volume",
+                        "close_time", "quote_vol", "trades", "taker_buy_base",
+                        "taker_buy_quote", "ignore"
+                    ]
+                    if not _kl:
+                        return None
+                    if len(_kl[0]) >= 12:
+                        _df = _pd.DataFrame(_kl, columns=_cols12)
+                    else:
+                        _df = _pd.DataFrame(_kl, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                    _df = _df[["timestamp", "open", "high", "low", "close", "volume"]].copy()
+                    for _c in ["open", "high", "low", "close", "volume"]:
+                        _df[_c] = _pd.to_numeric(_df[_c], errors="coerce")
+                    return _df.dropna()
+
+                def _fs_get(_row, _names, _default=0.0):
+                    for _n in _names:
+                        if _n in _row:
+                            try:
+                                return float(_row[_n])
+                            except Exception:
+                                pass
+                    return _default
+
+                def _fs_state(_tf, _kl_src=None):
+                    try:
+                        _klx = _kl_src if _kl_src is not None else client.klines(sym, _tf, settings.klines_limit)
+                        _df = _fs_df(_klx)
+                        if _df is None or len(_df) < 25:
+                            return "neutral"
+
+                        _feat = _fs_feat(_df).dropna()
+                        if len(_feat) < 4:
+                            return "neutral"
+
+                        _a = _feat.iloc[-1]
+                        _b = _feat.iloc[-2]
+                        _c = _feat.iloc[-3]
+
+                        _close = float(_df["close"].iloc[-1])
+                        _close1 = float(_df["close"].iloc[-2])
+                        _open = float(_df["open"].iloc[-1])
+                        _low12 = float(_df["low"].tail(12).min())
+                        _high12 = float(_df["high"].tail(12).max())
+
+                        _ma7 = float(_df["close"].rolling(7).mean().iloc[-1])
+                        _ma25 = float(_df["close"].rolling(25).mean().iloc[-1])
+
+                        _rsi = _fs_get(_a, ["rsi", "rsi_6", "rsi6", "RSI", "RSI6"], 50.0)
+                        _rsi1 = _fs_get(_b, ["rsi", "rsi_6", "rsi6", "RSI", "RSI6"], 50.0)
+
+                        _st = _fs_get(_a, ["stochrsi", "stoch_rsi", "stochrsi_k", "stoch_k", "STOCHRSI"], 50.0)
+                        _st1 = _fs_get(_b, ["stochrsi", "stoch_rsi", "stochrsi_k", "stoch_k", "STOCHRSI"], 50.0)
+                        _st2 = _fs_get(_c, ["stochrsi", "stoch_rsi", "stochrsi_k", "stoch_k", "STOCHRSI"], 50.0)
+
+                        _macd = _fs_get(_a, ["macd_hist", "hist", "macd", "MACD"], 0.0)
+                        _macd1 = _fs_get(_b, ["macd_hist", "hist", "macd", "MACD"], 0.0)
+
+                        _rsi_up = _rsi > _rsi1
+                        _rsi_dn = _rsi < _rsi1
+                        _st_up = (_st > _st1 and (_st1 <= _st2 or _st < 70))
+                        _st_dn = (_st < _st1 and (_st1 >= _st2 or _st > 30))
+                        _macd_up = _macd > _macd1
+                        _macd_dn = _macd < _macd1
+
+                        _green = _close > _open or _close > _close1
+                        _red = _close < _open or _close < _close1
+
+                        _near_low = (_close - _low12) / max(_low12, 1e-9) <= 0.008
+                        _near_high = (_high12 - _close) / max(_high12, 1e-9) <= 0.008
+
+                        # Bounce naik dari bawah / recovery.
+                        _bounce_up = (
+                            (_rsi <= 35 and _rsi_up and (_st_up or _macd_up))
+                            or (_st <= 35 and _st_up and _macd_up)
+                            or (_near_low and _green and _rsi_up)
+                            or (_close > _ma7 and _rsi_up and _macd_up)
+                        )
+
+                        # Reject turun dari atas / fading.
+                        _reject_down = (
+                            (_rsi >= 65 and _rsi_dn and (_st_dn or _macd_dn))
+                            or (_st >= 65 and _st_dn and _macd_dn)
+                            or (_near_high and _red and _rsi_dn)
+                            or (_close < _ma7 and _rsi_dn and _macd_dn)
+                        )
+
+                        if _bounce_up:
+                            return "bounce_up"
+                        if _reject_down:
+                            return "reject_down"
+                        return "neutral"
+                    except Exception:
+                        return "neutral"
+
+                # Pakai kl aktif untuk tf0 kalau sesuai, sisanya fetch cepat.
+                _fs_s1 = _fs_state("1m")
+                _fs_s3 = _fs_state("3m")
+                _fs_s5 = _fs_state(tf0, kl)
+                _fs_s15 = _fs_state("15m")
+
+                _bounce_votes = sum(1 for _x in [_fs_s1, _fs_s3, _fs_s5, _fs_s15] if _x == "bounce_up")
+                _reject_votes = sum(1 for _x in [_fs_s1, _fs_s3, _fs_s5, _fs_s15] if _x == "reject_down")
+
+                # Lebih ketat: kalau 5m/15m ikut bounce, SHORT harus diblok meski vote cuma 2.
+                _major_bounce = (_fs_s5 == "bounce_up" or _fs_s15 == "bounce_up")
+                _major_reject = (_fs_s5 == "reject_down" or _fs_s15 == "reject_down")
+
+                if sig_side == "SHORT" and _bounce_votes >= 2 and _major_bounce:
+                    event(
+                        f"{sym}: FASTSCAN-MTF block SHORT "
+                        f"(1m={_fs_s1}, 3m={_fs_s3}, 5m={_fs_s5}, 15m={_fs_s15})"
+                    )
+                    refresh_dashboard(free, daily, positions_view)
+                    time.sleep(1)
+                    continue
+
+                if sig_side == "LONG" and _reject_votes >= 2 and _major_reject:
+                    event(
+                        f"{sym}: FASTSCAN-MTF block LONG "
+                        f"(1m={_fs_s1}, 3m={_fs_s3}, 5m={_fs_s5}, 15m={_fs_s15})"
+                    )
+                    refresh_dashboard(free, daily, positions_view)
+                    time.sleep(1)
+                    continue
+
+            except Exception as _fs_mtf_e:
+                event(f"FASTSCAN-MTF guard error {sym}: {_fs_mtf_e}", "warning")
+
+            # -------- Entry (hybrid: limit utk SOL/DOGE/XRP, market utk BNB) --------
+            entry_fill = price
+            if prof.order_type == "limit":
+                bt = client.book_ticker(sym)
+                limit_p = float(bt.get("bidPrice" if sig_side == "LONG" else "askPrice") or price)
+                if settings.maker_first_enable:
+                    _bid = float(bt.get("bidPrice") or limit_p)
+                    _ask = float(bt.get("askPrice") or limit_p)
+                    _tick = client.trade_rules(sym).get("tick_size", 0) or 0
+                    limit_p = maker_price(sig_side, _bid, _ask, _tick, settings.maker_first_offset_ticks)
+                try:
+                    order = client.entry_limit_order(sym, sig_side, qty, limit_p)
+                except Exception as e:
+                    event(f"Limit entry {sym} failed: {e}", "warning")
+                    time.sleep(settings.loop_seconds); continue
+                oid = order.get("orderId")
+                filled = False
+                if settings.dry_run:
+                    filled = True
+                else:
+                    waited = 0
+                    while waited < settings.limit_fill_timeout_sec:
+                        time.sleep(2); waited += 2
+                        try:
+                            st = client.order_status(sym, oid)
+                            if str(st.get("status")) == "FILLED":
+                                filled = True; break
+                        except Exception:
+                            continue
+                    if not filled:
+                        try: client.cancel_order(sym, oid)
+                        except Exception: pass
+                        event(f"Limit {sig_side} {sym} not filled in {settings.limit_fill_timeout_sec}s, cancelled")
+                        refresh_dashboard(free, daily, positions_view); time.sleep(settings.loop_seconds); continue
+                entry_fill = limit_p
+                event(f"ENTRY LIMIT {sig_side} {sym} qty={qty} @ {client.round_price(sym, limit_p)} | ML conf={conf:.2f}")
+            else:
+                _ice = []
+                if (settings.iceberg_enable
+                        and qty * price >= (rules.get("min_notional", 5.0) or 5.0) * settings.iceberg_min_notional_mult):
+                    _ice = split_iceberg(qty, settings.iceberg_chunks,
+                                         rules.get("step_size", 0) or 0, rules.get("min_qty", 0) or 0)
+                if len(_ice) > 1:
+                    for _ci, _cq in enumerate(_ice):
+                        client.entry_order(sym, sig_side, _cq)
+                        if _ci < len(_ice) - 1:
+                            time.sleep(0.5)
+                    event(f"ENTRY MARKET iceberg x{len(_ice)} {sig_side} {sym} qty={qty} @~{price} | ML conf={conf:.2f}")
+                else:
+                    client.entry_order(sym, sig_side, qty)
+                    event(f"ENTRY MARKET {sig_side} {sym} qty={qty} @~{price} | ML conf={conf:.2f}")
+
+            # Ambil entry price aktual dari posisi (jika live)
+            try:
+                pos = next((q for q in client.open_positions() if q.get("symbol") == sym), None)
+                if pos and float(pos.get("entryPrice") or 0) > 0:
+                    entry_fill = float(pos["entryPrice"])
+            except Exception:
+                pass
+
+            # -------- SL/TP per-pair (RR 1:2 + ATR utk SOL) --------
+            try:
+                kl2   = client.klines(sym, tf0, 80)
+                highs_e = [float(k[2]) for k in kl2]
+                lows_e  = [float(k[3]) for k in kl2]
+                closes_e= [float(k[4]) for k in kl2]
+                atr_e   = atr(highs_e, lows_e, closes_e, 14)
+            except Exception:
+                atr_e = 0.0
+
+            sl, tp, sl_dist = plan_levels(sym, sig_side, entry_fill, atr_e, eff_min_tp, hc_meta.get("tp_mult", 0.0))
+            if settings.dynamic_atr_tpsl_enable and atr_e > 0:
+                _tb = dynamic_atr_tpsl(sig_side, entry_fill, atr_e,
+                                       sl_mult=settings.atr_sl_mult, tp_mult=settings.atr_tp_mult,
+                                       min_sl_pct=settings.atr_tpsl_min_sl_pct,
+                                       max_sl_pct=settings.atr_tpsl_max_sl_pct)
+                sl, tp, sl_dist = _tb.sl, _tb.tp, _tb.sl_dist
+                event(f"Dynamic ATR TP/SL {sym}: SL={client.round_price(sym,sl)} TP={client.round_price(sym,tp)} (ATR={atr_e:.6f})")
+            try:
+                client.stop_loss_order(sym, sig_side, sl, qty)
+                client.take_profit_order(sym, sig_side, tp, qty)
+                sl_pct_r = sl_dist / entry_fill * 100 if entry_fill > 0 else 0
+                event(f"SL={client.round_price(sym,sl)} TP={client.round_price(sym,tp)} (SL {sl_pct_r:.2f}% RR 1:{prof.rr:.0f})")
+            except Exception as e:
+                event(f"Placing SL/TP {sym} failed (code {_binance_code(e)}): {e}", "error")
+
+            # Telegram: notif entry
+            tg.entry(sym, sig_side, qty, entry_fill, sl, tp, conf,
+                     fng=_sentiment.get("score", 50))
+
+            state["last_trade_ts"] = time.time()
+            state["daily_trades"]   = state.get("daily_trades", 0) + 1
+            state.setdefault("last_trade_per_pair", {})[sym] = time.time()
+            state.setdefault("entry_time", {})[sym] = time.time()
+            save_state(state)
+            refresh_dashboard(free, daily, positions_view)
+            time.sleep(settings.loop_seconds)
+
+        except KeyboardInterrupt:
+            event("Dihentikan oleh user")
+            break
+        except Exception as e:
+            event(f"Loop error: {e}", "error")
+            time.sleep(10)
+
+
+if __name__ == "__main__":
+    main()

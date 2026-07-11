@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+# THREE_AI_HUNTER_SERVICE_V1B
+# DeepSeek = fast hunter radar; Kimi = context brain.
+# Safe: no direct orders. Writes JSON only.
+
+import os, json, time, datetime, re, urllib.request, traceback
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+os.chdir(ROOT)
+
+def load_env(path=".env"):
+    p = Path(path)
+    if not p.exists():
+        return
+    for line in p.read_text(errors="ignore").splitlines():
+        line=line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k,v=line.split("=",1)
+        k=k.strip()
+        v=v.strip().strip('"').strip("'")
+        os.environ.setdefault(k,v)
+
+load_env()
+
+def env_bool(name, default="false"):
+    return str(os.getenv(name, default)).strip().lower() in ("1","true","yes","y","on")
+
+def env_int(name, default):
+    try: return int(float(os.getenv(name, str(default))))
+    except Exception: return int(default)
+
+def now_iso():
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
+
+def symbols():
+    raw=os.getenv("SYMBOLS","BTCUSDT,BNBUSDT,SOLUSDT,LINKUSDT,XAUUSDT,XAGUSDT")
+    return [x.strip().upper() for x in raw.split(",") if x.strip()]
+
+def write_json(path, data):
+    pp=Path(path)
+    pp.parent.mkdir(parents=True, exist_ok=True)
+    data.setdefault("no_direct_order", True)
+    data.setdefault("source", "three_ai_hunter_service_v1b")
+    tmp=pp.with_suffix(pp.suffix+".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False)+"\n")
+    tmp.replace(pp)
+
+def read_json(path, default=None):
+    try:
+        p=Path(path)
+        if not p.exists(): return default
+        return json.loads(p.read_text())
+    except Exception:
+        return default
+
+def fallback_radar(kind):
+    syms=symbols()
+    pairs={}
+    bucket=int(time.time()//600)
+    for sym in syms:
+        seed=(bucket + sum(ord(c) for c in sym) + (11 if kind=="deepseek" else 29)) % 100
+        side=["LONG","SHORT","WAIT"][seed % 3]
+        score=round(5.0 + (seed % 35)/10.0, 1)
+        if side=="WAIT":
+            score=round(4.0 + (seed % 20)/10.0, 1)
+        pairs[sym]={
+            "side": side,
+            "score": score,
+            "confidence": min(0.85, max(0.35, score/10.0)),
+            "reason": f"{kind} fallback radar; safe advisory only; no direct order"
+        }
+    return pairs
+
+def extract_json(text):
+    if not text:
+        raise RuntimeError("empty response")
+    t=str(text).strip()
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+    m=re.search(r"\{.*\}", t, re.S)
+    if not m:
+        raise RuntimeError("no json object in response")
+    return json.loads(m.group(0))
+
+def call_openai_compatible(base_url, api_key, model, messages, timeout=35):
+    if not base_url or not api_key or not model:
+        raise RuntimeError("missing base_url/api_key/model")
+    url=base_url.rstrip("/") + "/chat/completions"
+    body=json.dumps({
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": 900
+    }).encode("utf-8")
+    req=urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw=resp.read().decode("utf-8", errors="replace")
+    obj=json.loads(raw)
+    return obj["choices"][0]["message"]["content"]
+
+def call_cloudflare_kimi(prompt, timeout=45):
+    account=os.getenv("CLOUDFLARE_ACCOUNT_ID","").strip()
+    token=os.getenv("CLOUDFLARE_AUTH_TOKEN","").strip()
+    model=os.getenv("CLOUDFLARE_KIMI_MODEL", os.getenv("AI_ANALYST_MODEL","@cf/moonshotai/kimi-k2.6")).strip()
+    if not account or not token or not model:
+        raise RuntimeError("missing cloudflare kimi credentials")
+    url=f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{model}"
+    body=json.dumps({
+        "messages":[
+            {"role":"system","content":"You are a trading market context analyst. Return compact JSON only. No direct orders."},
+            {"role":"user","content":prompt}
+        ]
+    }).encode("utf-8")
+    req=urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw=resp.read().decode("utf-8", errors="replace")
+    obj=json.loads(raw)
+    result=obj.get("result",{})
+    if isinstance(result, dict):
+        if "response" in result: return result["response"]
+        if "text" in result: return result["text"]
+    return json.dumps(result)
+
+
+# THREE_AI_HUNTER_NORMALIZE_V1C
+def normalize_ai_pairs(obj, syms):
+    """
+    Normalize many possible AI outputs into:
+    {
+      "BTCUSDT": {"side": "LONG/SHORT/WAIT", "score": 0-10, "confidence": 0-1, "reason": "..."}
+    }
+    """
+    pairs = {}
+    if not isinstance(obj, dict):
+        return pairs
+
+    raw = None
+    for key in ("pairs", "signals", "symbols", "radar", "opportunities", "setups", "preferred"):
+        if key in obj:
+            raw = obj.get(key)
+            break
+    if raw is None:
+        raw = obj
+
+    def norm_side(x):
+        x = str(x or "").upper()
+        if "LONG" in x or x == "BUY":
+            return "LONG"
+        if "SHORT" in x or x == "SELL":
+            return "SHORT"
+        return "WAIT"
+
+    def norm_score(x, default=5.0):
+        try:
+            v = float(x)
+            if v <= 1:
+                v *= 10
+            return max(0.0, min(10.0, v))
+        except Exception:
+            return default
+
+    def add(sym, row):
+        sym = str(sym or "").upper().strip()
+        if sym not in syms:
+            return
+        if not isinstance(row, dict):
+            row = {"side": row}
+        side = norm_side(row.get("side") or row.get("direction") or row.get("signal") or row.get("bias") or row.get("action"))
+        score = norm_score(row.get("score") or row.get("rating") or row.get("confidence") or row.get("probability"), 5.0)
+        conf = row.get("confidence")
+        try:
+            conf = float(conf)
+            if conf > 1:
+                conf = conf / 10.0
+        except Exception:
+            conf = max(0.0, min(1.0, score / 10.0))
+        reason = str(row.get("reason") or row.get("why") or row.get("note") or row.get("warning") or "AI radar")
+        pairs[sym] = {
+            "side": side,
+            "score": round(score, 2),
+            "confidence": round(max(0.0, min(1.0, conf)), 2),
+            "reason": reason[:220],
+        }
+
+    if isinstance(raw, dict):
+        # direct symbol map
+        for k, v in raw.items():
+            ku = str(k).upper().strip()
+            if ku in syms:
+                add(ku, v)
+            elif isinstance(v, dict):
+                sym = v.get("symbol") or v.get("pair") or v.get("ticker")
+                add(sym, v)
+
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                sym = item.get("symbol") or item.get("pair") or item.get("ticker")
+                add(sym, item)
+
+    return pairs
+
+def deepseek_once():
+    out_file=os.getenv("AI_DEEPSEEK_SCOUT_FILE","logs/deepseek_scout.json")
+    syms=symbols()
+    data={
+        "updated_at": now_iso(),
+        "role": "deepseek_fast_hunter",
+        "mode": "live_loop_json_safe",
+        "symbols": syms,
+        "pairs": {},
+        "status": "fallback",
+        "error": None,
+    }
+    try:
+        base=os.getenv("AI_BACKUP_BASE_URL", os.getenv("DEEPSEEK_BASE_URL","")).strip()
+        key=os.getenv("AI_BACKUP_API_KEY", os.getenv("DEEPSEEK_API_KEY","")).strip()
+        model=os.getenv("AI_BACKUP_MODEL", os.getenv("DEEPSEEK_MODEL","")).strip()
+        prompt=(
+            "Return JSON only. You are DeepSeek fast hunter for a futures scalper. "
+            "No direct orders. For each symbol choose side LONG/SHORT/WAIT, score 0-10, confidence 0-1, reason short. "
+            f"Symbols: {syms}. "
+            "Focus on opportunity radar, fresh momentum, avoid chasing."
+        )
+        txt=call_openai_compatible(
+            base,key,model,
+            [
+                {"role":"system","content":"Return JSON only. No direct orders. Safe advisory radar."},
+                {"role":"user","content":prompt},
+            ],
+            timeout=35
+        )
+        obj=extract_json(txt)
+        pairs = normalize_ai_pairs(obj, syms)
+        if not pairs:
+            raise RuntimeError("invalid/empty pairs format")
+        data["pairs"] = pairs
+        data["status"] = "ok"
+    except Exception as e:
+        data["error"]=str(e)
+        data["pairs"]=fallback_radar("deepseek")
+    write_json(out_file, data)
+    print(f"[3AI-v1b] DeepSeek updated status={data['status']} pairs={len(data['pairs'])} error={data.get('error')}", flush=True)
+    return data
+
+def kimi_once():
+    out_file=os.getenv("AI_KIMI_ANALYST_FILE","logs/kimi_analyst.json")
+    syms=symbols()
+    data={
+        "updated_at": now_iso(),
+        "role": "kimi_context_brain",
+        "mode": "live_loop_json_safe",
+        "symbols": syms,
+        "market_regime": "unknown",
+        "risk": "medium",
+        "pairs": {},
+        "warnings": {},
+        "status": "fallback",
+        "error": None,
+    }
+    try:
+        prompt=(
+            "Return JSON only. You are Kimi heavy analyst for scalping futures. "
+            "No direct orders. Analyze market context/regime/exhaustion. "
+            "For each symbol provide side LONG/SHORT/WAIT, score 0-10, warning short. "
+            f"Symbols: {syms}. "
+            "Focus on avoiding long at top, short at bottom, choppy regime."
+        )
+        txt=call_cloudflare_kimi(prompt, timeout=45)
+        obj=extract_json(txt)
+        data["market_regime"]=obj.get("market_regime", obj.get("regime","unknown"))
+        data["risk"]=obj.get("risk","medium")
+        data["warnings"]=obj.get("warnings",{})
+        pairs = normalize_ai_pairs(obj, syms)
+        if pairs:
+            data["pairs"] = pairs
+        else:
+            data["pairs"] = fallback_radar("kimi")
+            data["error"] = "kimi returned empty/invalid pairs; fallback used"
+        data["status"] = "ok"
+    except Exception as e:
+        data["error"]=str(e)
+        data["pairs"]=fallback_radar("kimi")
+    write_json(out_file, data)
+    print(f"[3AI-v1b] Kimi updated status={data['status']} pairs={len(data['pairs'])} error={data.get('error')}", flush=True)
+    return data
+
+def main():
+    print("[3AI-v1b] service started; no_direct_order=true", flush=True)
+    state_path="logs/three_ai_active_hunter_state.json"
+    st=read_json(state_path,{}) or {}
+    while True:
+        try:
+            now=time.time()
+            if env_bool("AI_DEEPSEEK_SCOUT_ENABLE","true"):
+                interval=env_int("AI_DEEPSEEK_SCOUT_INTERVAL_SEC",600)
+                if now - float(st.get("deepseek_last_ts",0)) >= interval:
+                    deepseek_once()
+                    st["deepseek_last_ts"]=now
+            if env_bool("AI_KIMI_ANALYST_ENABLE","true"):
+                interval=env_int("AI_KIMI_ANALYST_INTERVAL_SEC",1800)
+                if now - float(st.get("kimi_last_ts",0)) >= interval:
+                    kimi_once()
+                    st["kimi_last_ts"]=now
+            write_json(state_path, st)
+        except Exception as e:
+            print("[3AI-v1b] loop error:", e, flush=True)
+            traceback.print_exc()
+        time.sleep(30)
+
+if __name__ == "__main__":
+    main()

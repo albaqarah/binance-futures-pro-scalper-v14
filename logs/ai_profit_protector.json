@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "mode": "safe_advisory_first",
+  "min_roi": 0.6,
+  "updated_at": 1783597056,
+  "actions": [],
+  "note": "Advisory foundation. No force close."
+}

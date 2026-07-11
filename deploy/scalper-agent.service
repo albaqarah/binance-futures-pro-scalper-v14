@@ -1,0 +1,18 @@
+[Unit]
+Description=Binance Futures Pro Scalper v14 - AI Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Testdriv12/binance-futures-pro-scalper-v14
+EnvironmentFile=/home/ubuntu/Testdriv12/binance-futures-pro-scalper-v14/.env
+ExecStart=/home/ubuntu/Testdriv12/binance-futures-pro-scalper-v14/.venv/bin/python ai_agent.py
+Restart=always
+RestartSec=15
+StandardOutput=append:/home/ubuntu/Testdriv12/binance-futures-pro-scalper-v14/logs/agent.out
+StandardError=append:/home/ubuntu/Testdriv12/binance-futures-pro-scalper-v14/logs/agent.out
+
+[Install]
+WantedBy=multi-user.target

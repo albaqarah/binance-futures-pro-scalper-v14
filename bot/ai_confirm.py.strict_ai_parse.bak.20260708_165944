@@ -1,0 +1,140 @@
+"""v10.1 (H) — AI-Confirm Borderline.
+
+Dipanggil HANYA untuk SATU kandidat borderline per loop (skor confluence mepet
+di bawah threshold). Memakai endpoint OpenAI-compatible (mis. Bluesminds).
+
+Aman by design: kalau AI error / timeout / ragu -> return False (TIDAK entry).
+Tidak akan pernah memaksa entry kalau AI tidak yakin.
+"""
+from __future__ import annotations
+import json, os
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+
+def _env(name: str, default: str = "") -> str:
+    """Baca environment var, fallback ke file .env (root project)."""
+    v = os.getenv(name)
+    if v not in (None, ""):
+        return v
+    try:
+        p = Path(".env")
+        if p.exists():
+            for line in p.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("#") or "=" not in line:
+                    continue
+                k, val = line.split("=", 1)
+                if k.strip() == name:
+                    return val.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return default
+
+
+def _agent_cfg():
+    """v14: AI Agent pakai KEY SENDIRI (AI_AGENT_API_KEY) yang diinput manual,
+    DIPISAH dari key trading bot. Fallback ke OPENAI_* biar setup lama tetap jalan
+    kalau AI_AGENT_* sengaja dikosongkan.
+    Return (key, base_url, model).
+    """
+    key   = _env("AI_AGENT_API_KEY")  or _env("OPENAI_API_KEY")
+    base  = (_env("AI_AGENT_BASE_URL") or _env("OPENAI_BASE_URL", "https://api.openai.com/v1")).rstrip("/")
+    model = _env("AI_AGENT_MODEL")    or _env("OPENAI_MODEL", "gpt-4o-mini")
+    return key, base, model
+
+
+def confirm_entry(symbol, side, conf, conf_score, score_parts,
+                  sentiment, news_bias, timeout: int = 25):
+    """Tanya AI: layak entry borderline ini? Return (bool_ok, alasan_str)."""
+    key, base, model = _agent_cfg()
+    if not key:
+        return False, "no-key"
+    fng = sentiment.get("score", 50) if isinstance(sentiment, dict) else 50
+    parts = " ".join(score_parts) if score_parts else "-"
+    prompt = (
+        f"BORDERLINE crypto scalping setup (score just below the threshold).\n"
+        f"Pair: {symbol} | Direction: {side}\n"
+        f"ML confidence: {conf*100:.0f}% | Confluence score: {conf_score:+.1f}\n"
+        f"Score breakdown: {parts}\n"
+        f"Fear&Greed: {fng}/100 | News bias: {news_bias}\n\n"
+        "Weigh risk vs reward. Is this entry worth taking?\n"
+        "Answer with the FIRST word: YES or NO, "
+        "then a short reason of at most 12 words."
+    )
+    try:
+        body = json.dumps({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": (
+                    "You are a disciplined, conservative crypto scalping analyst. "
+                    "Only agree when reward clearly outweighs risk. Answer concisely."
+                )},
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": 60,
+            "temperature": 0.1,
+        }).encode()
+        req = Request(f"{base}/chat/completions", data=body, method="POST",
+                      headers={"Content-Type": "application/json",
+                               "Authorization": f"Bearer {key}", "User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=timeout) as r:
+            resp = json.loads(r.read())
+        txt  = resp["choices"][0]["message"]["content"].strip()
+        head = txt.lower().lstrip("*_# ")[:8]
+        ok   = head.startswith("ya") or head.startswith("yes")
+        return ok, txt[:90].replace("\n", " ")
+    except Exception as e:
+        return False, f"err:{e}"
+
+
+def veto_entry(symbol, side, conf, conf_score, sentiment, news_bias,
+               regime="unknown", strict: bool = False, timeout: int = 20):
+    """v14 Veto Gate — overseer terakhir untuk kandidat entry TERBAIK.
+
+    AI HANYA boleh MELOLOSKAN (kasih grade A/B/C) atau MEM-VETO (batalkan).
+    Return (allow_bool, grade_str, reason_str).
+    FAIL-OPEN by design: tanpa key / error / timeout -> allow, KECUALI strict=True.
+    """
+    import re as _re
+    key, base, model = _agent_cfg()
+    if not key:
+        return (not strict), "?", "no-key"
+    fng = sentiment.get("score", 50) if isinstance(sentiment, dict) else 50
+    prompt = (
+        f"The scalping signal has ALREADY passed all ML + confluence filters. "
+        f"You are the final overseer before the order is executed.\n"
+        f"Pair: {symbol} | Direction: {side}\n"
+        f"ML confidence: {conf*100:.0f}% | Confluence score: {conf_score:+.1f}\n"
+        f"Fear&Greed: {fng}/100 | News bias: {news_bias} | Regime: {regime}\n\n"
+        "Look for a STRONG REASON to CANCEL this entry (regime against the direction, "
+        "extreme opposing news/funding, bad timing). If there is no strong reason, LET IT PASS.\n"
+        "Reply: first word PASS or VETO, then a grade A/B/C, then a reason of at most 12 words.\n"
+        "Example: 'PASS B with the trend, healthy pullback' / 'VETO C ranging regime against signal'."
+    )
+    try:
+        body = json.dumps({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": (
+                    "You are a disciplined scalping risk overseer. Your job is to PREVENT bad entries, "
+                    "not create signals. Approve only when the risk is reasonable. Answer concisely."
+                )},
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": 40,
+            "temperature": 0.1,
+        }).encode()
+        req = Request(f"{base}/chat/completions", data=body, method="POST",
+                      headers={"Content-Type": "application/json",
+                               "Authorization": f"Bearer {key}", "User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=timeout) as r:
+            resp = json.loads(r.read())
+        txt  = resp["choices"][0]["message"]["content"].strip()
+        head = txt.lower().lstrip("*_# ")
+        veto = head.startswith("veto") or head.startswith("batal") or head.startswith("no")
+        gm   = _re.search(r"\b([ABC])\b", txt.upper())
+        grade = gm.group(1) if gm else "B"
+        return (not veto), grade, txt[:90].replace("\n", " ")
+    except Exception as e:
+        return (not strict), "?", f"err:{e}"
